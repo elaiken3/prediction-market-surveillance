@@ -112,7 +112,7 @@ services:
       - --server.address=0.0.0.0
       - --server.port=8501
     ports:
-      - "127.0.0.1:8501:8501"   # localhost only; expose via Tailscale, not the public IP
+      - "${DASH_BIND:-127.0.0.1}:8501:8501"   # localhost by default; set DASH_BIND=0.0.0.0 to reach via Tailscale
 
   # On-demand batch: pull resolutions, build dbt + reconciliation. Triggered by
   # the systemd timer via:  docker compose -f deploy/docker-compose.vm.yml run --rm batch
@@ -125,11 +125,15 @@ services:
       MOTHERDUCK_TOKEN: ${MOTHERDUCK_TOKEN:-}
     volumes:
       - ./../data:/app/data
+      - ./../deploy:/app/deploy      # host edits to profiles picked up without rebuild
     working_dir: /app
     command:
       - /bin/sh
       - -c
       - >
+        if [ "$$DBT_TARGET" = "motherduck" ]; then
+        python -c "import duckdb, os; duckdb.connect('md:?motherduck_token=' + os.environ['MOTHERDUCK_TOKEN']).execute('CREATE DATABASE IF NOT EXISTS market_surveillance')";
+        fi;
         python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 &&
         cd dbt/market_surveillance &&
         dbt deps &&

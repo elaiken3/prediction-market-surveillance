@@ -66,7 +66,7 @@ def _from_price_change(msg: dict) -> list[dict]:
     out: list[dict] = []
     market = msg.get("market") or msg.get("condition_id")
     ts = _ts(msg.get("timestamp"))
-    for ch in msg.get("changes", []) or []:
+    for ch in msg.get("price_changes", msg.get("changes", [])) or []:
         out.append({
             "source": SOURCE,
             "event_type": "quote",

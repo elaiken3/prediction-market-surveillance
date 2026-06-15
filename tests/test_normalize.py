@@ -50,3 +50,19 @@ def test_unknown_event_type_returns_empty():
 
 def test_non_dict_returns_empty():
     assert normalize("not-a-dict") == []  # type: ignore[arg-type]
+
+
+def test_live_price_changes_key_maps():
+    """Polymarket sends the changes array under 'price_changes', not 'changes'."""
+    msg = {
+        "event_type": "price_change",
+        "market": "0xcondition",
+        "timestamp": "1750000000000",
+        "price_changes": [
+            {"asset_id": "0xyes", "price": "0.61", "size": "100", "side": "BUY"},
+            {"asset_id": "0xno", "price": "0.39", "size": "100", "side": "SELL"},
+        ],
+    }
+    out = normalize(msg)
+    assert len(out) == 2 and {o["asset_id"] for o in out} == {"0xyes", "0xno"}
+    assert all(validate_record(o).valid for o in out)
