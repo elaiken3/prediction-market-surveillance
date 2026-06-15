@@ -1,0 +1,21 @@
+data/
+*.duckdb
+*.duckdb.wal
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+dbt/market_surveillance/target/
+dbt/market_surveillance/dbt_packages/
+dbt/market_surveillance/logs/
+spark-warehouse/
+metastore_db/
+derby.log
+.env
+*.p8
+*.pem
+
+# streamlit cloud secrets
+.streamlit/secrets.toml
+dbt/market_surveillance/profiles.yml

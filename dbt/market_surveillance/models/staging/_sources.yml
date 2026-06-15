@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: lake
+    description: Parquet zones written by the Spark streaming job (+ a batch resolutions pull).
+    tables:
+      - name: valid
+        meta:
+          external_location: "read_parquet('{{ var('lake_path') }}/valid/**/*.parquet', union_by_name=true)"
+      - name: dlq
+        meta:
+          external_location: "read_parquet('{{ var('lake_path') }}/dlq/**/*.parquet', union_by_name=true)"
+      - name: flagged
+        meta:
+          external_location: "read_parquet('{{ var('lake_path') }}/flagged/**/*.parquet', union_by_name=true)"
+      - name: resolutions
+        description: Resolved markets pulled from the Gamma API by ingestion/fetch_resolutions.py.
+        meta:
+          external_location: "read_parquet('{{ var('lake_path') }}/resolutions/**/*.parquet', union_by_name=true)"

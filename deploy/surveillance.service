@@ -1,0 +1,19 @@
+# /etc/systemd/system/surveillance.service
+# Brings the always-on stack up on boot and down on stop.
+[Unit]
+Description=Prediction-Market Surveillance stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/prediction-market-surveillance
+Environment=INGEST_MODE=live
+ExecStart=/usr/bin/docker compose -f deploy/docker-compose.vm.yml up -d --build
+ExecStop=/usr/bin/docker compose -f deploy/docker-compose.vm.yml down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

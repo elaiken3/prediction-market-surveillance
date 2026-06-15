@@ -1,0 +1,16 @@
+# Used inside the batch container (DBT_PROFILES_DIR=/app/deploy).
+market_surveillance:
+  target: local
+  outputs:
+    local:
+      type: duckdb
+      path: "/app/data/warehouse.duckdb"
+      threads: 4
+      extensions: [parquet]
+    motherduck:
+      type: duckdb
+      # Marts are written to MotherDuck; the local session still reads the
+      # local parquet lake, so only aggregated tables leave the VM.
+      path: "md:market_surveillance?motherduck_token={{ env_var('MOTHERDUCK_TOKEN') }}"
+      threads: 4
+      extensions: [httpfs, parquet]

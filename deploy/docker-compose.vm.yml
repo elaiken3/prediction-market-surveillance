@@ -1,0 +1,140 @@
+# Full unattended stack for a VM. From the repo root:
+#   docker compose -f deploy/docker-compose.vm.yml up -d --build
+# Always-on services restart on crash/reboot. The batch job runs on a systemd
+# timer (see deploy/dbt-batch.*), not here.
+#
+# INGEST_MODE=live   -> stream real Polymarket data (needs egress)
+# INGEST_MODE=synthetic -> offline generator (no network), good for a first smoke test
+
+x-python-build: &python-build
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:19092
+    restart: unless-stopped
+    volumes:
+      - rp-data:/var/lib/redpanda/data
+    ports:
+      - "127.0.0.1:19092:19092"   # bind to localhost only; reach via SSH/Tailscale
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Create topics with retention so the broker disk can't fill forever.
+  topic-init:
+    image: redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        rpk topic create markets.events -p 6 -c retention.ms=259200000 --brokers redpanda:29092 || true;
+        rpk topic create markets.dlq -p 1 -c retention.ms=604800000 --brokers redpanda:29092 || true
+    restart: "no"
+
+  ingestion:
+    <<: *python-build
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      INGEST_MODE: ${INGEST_MODE:-synthetic}
+      BOOTSTRAP: redpanda:29092
+    # Picks live vs synthetic from INGEST_MODE.
+    command:
+      - /bin/sh
+      - -c
+      - >
+        if [ "$$INGEST_MODE" = "live" ]; then
+          python -m ingestion.polymarket_ws --bootstrap redpanda:29092 --topic markets.events --markets 8;
+        else
+          python -m ingestion.synthetic --bootstrap redpanda:29092 --topic markets.events --count 0 --rate 20 --manip-rate 0.05 --dirty-rate 0.05;
+        fi
+
+  spark-stream:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.spark
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./../data:/app/data
+      - ivy:/opt/ivy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      - --conf
+      - spark.jars.ivy=/opt/ivy
+      - /app/streaming/spark_job.py
+      - --bootstrap
+      - redpanda:29092
+      - --topic
+      - markets.events
+      - --lake
+      - /app/data/lake
+      - --checkpoints
+      - /app/data/checkpoints
+      - --trigger-seconds
+      - "60"
+
+  dashboard:
+    <<: *python-build
+    restart: unless-stopped
+    environment:
+      LAKE_PATH: /app/data/lake
+    volumes:
+      - ./../data:/app/data
+    command:
+      - streamlit
+      - run
+      - dashboard/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    ports:
+      - "127.0.0.1:8501:8501"   # localhost only; expose via Tailscale, not the public IP
+
+  # On-demand batch: pull resolutions, build dbt + reconciliation. Triggered by
+  # the systemd timer via:  docker compose -f deploy/docker-compose.vm.yml run --rm batch
+  batch:
+    <<: *python-build
+    profiles: ["batch"]
+    environment:
+      DBT_PROFILES_DIR: /app/deploy
+      DBT_TARGET: ${DBT_TARGET:-local}
+      MOTHERDUCK_TOKEN: ${MOTHERDUCK_TOKEN:-}
+    volumes:
+      - ./../data:/app/data
+    working_dir: /app
+    command:
+      - /bin/sh
+      - -c
+      - >
+        python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 &&
+        cd dbt/market_surveillance &&
+        dbt deps &&
+        dbt build --target "$$DBT_TARGET" --vars '{lake_path: /app/data/lake}'
+
+volumes:
+  rp-data:
+  ivy:

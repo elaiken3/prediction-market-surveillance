@@ -1,0 +1,10 @@
+# /etc/systemd/system/dbt-batch.service  (run by dbt-batch.timer)
+[Unit]
+Description=Refresh resolutions + build dbt models
+Requires=docker.service
+After=surveillance.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/prediction-market-surveillance
+ExecStart=/usr/bin/docker compose -f deploy/docker-compose.vm.yml run --rm batch

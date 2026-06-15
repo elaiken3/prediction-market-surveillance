@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: stg_market_events
+    description: Cleaned, contract-valid market events.
+    columns:
+      - name: event_id
+        data_tests: [not_null]
+      - name: price
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range: { min_value: 0, max_value: 1 }
+      - name: event_type
+        data_tests:
+          - accepted_values: { values: ["trade", "quote", "book"] }
+
+  - name: fct_price_minutely
+    columns:
+      - name: last_price
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range: { min_value: 0, max_value: 1 }
+
+  - name: fct_coherence
+    columns:
+      - name: is_incoherent
+        data_tests: [not_null]
+
+  - name: rec_stream_vs_batch
+    columns:
+      - name: reconciliation_status
+        data_tests:
+          - accepted_values: { values: ["BOTH", "STREAM_ONLY", "BATCH_ONLY"] }
+
+  - name: fct_calibration
+    columns:
+      - name: brier_score
+        data_tests:
+          - dbt_utils.accepted_range: { min_value: 0, max_value: 1 }

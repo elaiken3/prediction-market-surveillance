@@ -1,0 +1,14 @@
+# Spark streaming service. Uses the official Apache Spark image (JVM + PySpark
+# baked in). The Kafka connector is resolved via --packages at runtime into a
+# persistent ivy volume, so it downloads once. (Adjust the tag if 3.5.1-python3
+# is unavailable for your arch; on ARM/Oracle use the matching aarch64 image.)
+FROM apache/spark:3.5.1-python3
+
+WORKDIR /app
+COPY streaming /app/streaming
+
+# Runs as root to keep the mounted /app/data and /opt/ivy volumes writable
+# without uid juggling -- fine for a single-tenant personal VM.
+USER root
+
+ENV PYTHONUNBUFFERED=1

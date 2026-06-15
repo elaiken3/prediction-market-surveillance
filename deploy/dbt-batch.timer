@@ -1,0 +1,11 @@
+# /etc/systemd/system/dbt-batch.timer
+[Unit]
+Description=Run the surveillance batch every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

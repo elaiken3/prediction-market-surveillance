@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elaiken3.dev/contracts/market_event.schema.json",
+  "title": "MarketEvent",
+  "description": "Canonical, source-agnostic prediction-market event. Raw Polymarket websocket messages are normalised into this shape before they hit Kafka, so the pipeline never depends on one venue's wire format. Records that violate this contract are dead-lettered with a reason.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "event_type", "event_id", "event_ts", "market_id", "asset_id", "price"],
+  "properties": {
+    "source":     { "type": "string", "minLength": 1 },
+    "event_type": { "type": "string", "enum": ["trade", "quote", "book"] },
+    "event_id":   { "type": "string", "minLength": 6 },
+    "event_ts":   { "type": "string", "format": "date-time" },
+    "market_id":  { "type": "string", "minLength": 1, "description": "condition_id: the market" },
+    "asset_id":   { "type": "string", "minLength": 1, "description": "token_id: one outcome within the market" },
+    "outcome":    { "type": ["string", "null"] },
+    "price":      { "type": "number", "minimum": 0, "maximum": 1, "description": "prediction-market price is an implied probability" },
+    "size":       { "type": ["number", "null"], "minimum": 0 },
+    "side":       { "type": ["string", "null"], "enum": ["buy", "sell", null] }
+  }
+}

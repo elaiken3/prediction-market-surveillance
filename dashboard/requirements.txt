@@ -1,0 +1,4 @@
+# For Streamlit Community Cloud (point the app at dashboard/cloud_app.py)
+streamlit>=1.36
+duckdb>=1.0.0
+pandas>=2.0
