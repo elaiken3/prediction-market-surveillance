@@ -19,3 +19,9 @@ derby.log
 # streamlit cloud secrets
 .streamlit/secrets.toml
 dbt/market_surveillance/profiles.yml
+
+# python build artifacts
+*.egg-info/
+# dbt local state
+dbt/market_surveillance/.user.yml
+dbt/market_surveillance/package-lock.yml
