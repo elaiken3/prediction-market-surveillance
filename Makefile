@@ -29,7 +29,7 @@ resolutions:
 dbt:
 	mkdir -p dbt/market_surveillance/data
 	cp -n dbt/market_surveillance/profiles.example.yml dbt/market_surveillance/profiles.yml || true
-	python -m ingestion.seed_resolutions --lake $(PWD)/data/lake
+	python -m ingestion.seed_lake --lake $(PWD)/data/lake
 	cd dbt/market_surveillance && DBT_PROFILES_DIR=$(PWD)/dbt/market_surveillance dbt deps && \
 		DBT_PROFILES_DIR=$(PWD)/dbt/market_surveillance dbt build --vars '{lake_path: $(PWD)/data/lake}'
 

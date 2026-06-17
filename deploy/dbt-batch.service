@@ -5,6 +5,9 @@ Requires=docker.service
 After=surveillance.service
 
 [Service]
+# Optional: a gitignored env file can set DBT_TARGET=motherduck and MOTHERDUCK_TOKEN
+# to publish marts to MotherDuck. Absent -> the compose default (local) is used.
+EnvironmentFile=-/opt/prediction-market-surveillance/.env.motherduck
 Type=oneshot
 WorkingDirectory=/opt/prediction-market-surveillance
 ExecStart=/usr/bin/docker compose -f deploy/docker-compose.vm.yml run --rm batch

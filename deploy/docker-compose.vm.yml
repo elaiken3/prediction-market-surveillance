@@ -134,6 +134,7 @@ services:
         if [ "$$DBT_TARGET" = "motherduck" ]; then
         python -c "import duckdb, os; duckdb.connect('md:?motherduck_token=' + os.environ['MOTHERDUCK_TOKEN']).execute('CREATE DATABASE IF NOT EXISTS market_surveillance')";
         fi;
+        python -m ingestion.seed_lake --lake /app/data/lake &&
         python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 &&
         cd dbt/market_surveillance &&
         dbt deps &&
