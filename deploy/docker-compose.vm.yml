@@ -138,7 +138,8 @@ services:
         python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 &&
         cd dbt/market_surveillance &&
         dbt deps &&
-        dbt build --target "$$DBT_TARGET" --vars '{lake_path: /app/data/lake}'
+        dbt build --target "$$DBT_TARGET" --vars '{lake_path: /app/data/lake}' &&
+        cd /app && python -m ingestion.publish_marts
 
 volumes:
   rp-data:
