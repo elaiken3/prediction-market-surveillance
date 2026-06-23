@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir \
     "kafka-python>=2.0.2" \
     "websockets>=12.0" \
     "requests>=2.31" \
-    "duckdb>=1.0.0" \
+    "duckdb==1.5.3" \
     "pandas>=2.0" \
     "pyarrow>=15.0" \
     "dbt-core>=1.8" \
