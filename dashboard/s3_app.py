@@ -1,11 +1,11 @@
-"""Public dashboard for Streamlit Community Cloud, S3 edition.
+"""Public dashboard for Streamlit Community Cloud, S3 edition (finance-terminal theme).
 
 Reads the dbt marts as Parquet files over HTTPS from a public S3 prefix. It does
 not touch the VM or MotherDuck, so the link stays up regardless of the collector's
 health or any trial status.
 
 Secrets (Streamlit Cloud -> app settings -> Secrets, TOML):
-    marts_base_url = "https://YOUR_BUCKET.s3.us-east-2.amazonaws.com/marts"
+    marts_base_url = "https://YOUR_BUCKET.s3.us-east-1.amazonaws.com/marts"
 
 Locally you can instead set the env var MARTS_BASE_URL.
 """
@@ -15,19 +15,93 @@ import os
 
 import duckdb
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Prediction-Market Surveillance", layout="wide")
-st.title("Prediction-Market Surveillance")
-st.caption("Live data-health + manipulation surveillance on a Polymarket feed. "
-           "Marts served from S3; raw events stay on the collector.")
+# --------------------------------------------------------------------------- #
+# Page + theme
+# --------------------------------------------------------------------------- #
+st.set_page_config(
+    page_title="Prediction-Market Surveillance",
+    page_icon="📡",
+    layout="wide",
+)
+
+INK = "#0B0E14"
+PANEL = "#141A24"
+BORDER = "#243044"
+TEXT = "#E6EDF3"
+MUTED = "#8B98A9"
+AMBER = "#E8B339"
+GREEN = "#3FB950"
+RED = "#F85149"
+BLUE = "#58A6FF"
+
+st.markdown(
+    f"""
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+      html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
+      #MainMenu, footer, header {{ visibility: hidden; }}
+      [data-testid="stToolbar"] {{ display: none; }}
+      .block-container {{ padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1200px; }}
+
+      .masthead {{
+        border-bottom: 1px solid {BORDER}; padding-bottom: 1.1rem; margin-bottom: 1.6rem;
+      }}
+      .masthead .eyebrow {{
+        font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; letter-spacing: 0.18em;
+        text-transform: uppercase; color: {AMBER}; margin-bottom: 0.35rem;
+      }}
+      .masthead h1 {{
+        font-size: 1.9rem; font-weight: 700; color: {TEXT}; margin: 0 0 0.5rem 0; letter-spacing: -0.01em;
+      }}
+      .masthead p {{ color: {MUTED}; font-size: 0.95rem; line-height: 1.55; max-width: 760px; margin: 0; }}
+      .live-pill {{
+        display: inline-flex; align-items: center; gap: 0.4rem; font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem; letter-spacing: 0.1em; color: {GREEN}; border: 1px solid {BORDER};
+        border-radius: 999px; padding: 0.2rem 0.6rem; margin-left: 0.6rem; vertical-align: middle;
+      }}
+      .live-dot {{ width: 7px; height: 7px; border-radius: 50%; background: {GREEN}; box-shadow: 0 0 6px {GREEN}; }}
+
+      .kpi {{
+        background: {PANEL}; border: 1px solid {BORDER}; border-radius: 10px; padding: 1.1rem 1.2rem; height: 100%;
+      }}
+      .kpi .label {{
+        font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem; letter-spacing: 0.12em;
+        text-transform: uppercase; color: {MUTED}; margin-bottom: 0.5rem;
+      }}
+      .kpi .value {{ font-family: 'IBM Plex Mono', monospace; font-size: 1.85rem; font-weight: 600; color: {TEXT}; line-height: 1.1; }}
+      .kpi .sub {{ font-size: 0.78rem; color: {MUTED}; margin-top: 0.35rem; }}
+      .kpi .value.good {{ color: {GREEN}; }}
+      .kpi .value.warn {{ color: {AMBER}; }}
+      .kpi .value.bad {{ color: {RED}; }}
+
+      .section-title {{
+        font-size: 1.05rem; font-weight: 600; color: {TEXT}; margin: 2rem 0 0.2rem 0;
+        display: flex; align-items: center; gap: 0.5rem;
+      }}
+      .section-note {{ color: {MUTED}; font-size: 0.85rem; margin-bottom: 0.6rem; }}
+      .foot {{
+        border-top: 1px solid {BORDER}; margin-top: 2.6rem; padding-top: 1rem;
+        color: {MUTED}; font-size: 0.8rem; line-height: 1.6;
+      }}
+      .foot a {{ color: {BLUE}; text-decoration: none; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
+# --------------------------------------------------------------------------- #
+# Data access
+# --------------------------------------------------------------------------- #
 def _secret(name: str, default: str | None = None) -> str | None:
     try:
         if name in st.secrets:
             return st.secrets[name]
-    except Exception:  # noqa: BLE001 - secrets file may be absent locally
+    except Exception:  # noqa: BLE001
         pass
     return os.environ.get(name.upper(), default)
 
@@ -49,57 +123,203 @@ con = connect()
 
 
 @st.cache_data(ttl=60)
-def mart(name: str, where: str = "") -> pd.DataFrame:
-    """Read one mart Parquet file from S3; empty frame if it isn't published yet."""
-    sql = f"SELECT * FROM read_parquet('{BASE}/{name}.parquet') {where}"
+def mart(name: str) -> pd.DataFrame:
     try:
-        return con.execute(sql).fetch_df()
-    except Exception as exc:  # noqa: BLE001
-        st.info(f"`{name}` not available yet ({exc.__class__.__name__}). "
-                f"Has the batch published to S3?")
+        return con.execute(f"SELECT * FROM read_parquet('{BASE}/{name}.parquet')").fetch_df()
+    except Exception:  # noqa: BLE001
         return pd.DataFrame()
 
 
-# --- Ingest health ---
+def plotly_shell(fig: go.Figure, height: int = 300) -> go.Figure:
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=height,
+        margin=dict(l=10, r=10, t=10, b=10),
+        font=dict(family="IBM Plex Mono, monospace", size=12, color=TEXT),
+        showlegend=False,
+    )
+    fig.update_xaxes(gridcolor=BORDER, zerolinecolor=BORDER)
+    fig.update_yaxes(gridcolor=BORDER, zerolinecolor=BORDER)
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Load marts
+# --------------------------------------------------------------------------- #
 summary = mart("fct_ingest_summary")
-c1, c2, c3 = st.columns(3)
-if not summary.empty:
-    row = summary.iloc[0]
-    c1.metric("Valid events", f"{int(row['valid_count']):,}")
-    c2.metric("Dead-lettered", f"{int(row['dlq_count']):,}")
-    c3.metric("Contract reject rate", f"{row['reject_rate'] * 100:.1f}%")
-
-st.subheader("Why records were rejected")
 reasons = mart("fct_dead_letter_reasons")
-if not reasons.empty:
-    st.bar_chart(reasons.set_index("reject_reason"))
-
-# --- Coherence (sum of outcomes ~ 1) ---
-st.subheader("Market coherence violations (outcomes not summing to ~1)")
-incoherent = mart("fct_coherence", "where is_incoherent order by minute desc limit 50")
-if not incoherent.empty:
-    st.dataframe(incoherent[["market_id", "minute", "outcome_sum", "deviation"]],
-                 use_container_width=True)
-else:
-    st.caption("No coherence violations in the current window.")
-
-# --- Reconciliation: did the stream lie? ---
-st.subheader("Stream vs batch reconciliation")
+coherence = mart("fct_coherence")
 rec = mart("rec_stream_vs_batch")
-if not rec.empty:
-    counts = rec.groupby("reconciliation_status").size().rename("n").to_frame()
-    st.bar_chart(counts)
-
-# --- Calibration: was the market right? ---
-st.subheader("Calibration vs real resolutions (Brier score, lower is better)")
 cal = mart("fct_calibration")
-if not cal.empty:
-    st.metric("Mean Brier score", f"{cal['brier_score'].mean():.4f}",
-              help=f"over {len(cal)} resolved outcomes")
+
+valid = int(summary.iloc[0]["valid_count"]) if not summary.empty else 0
+dlq = int(summary.iloc[0]["dlq_count"]) if not summary.empty else 0
+reject_rate = float(summary.iloc[0]["reject_rate"]) if not summary.empty else 0.0
+
+violations = 0
+if not coherence.empty and "is_incoherent" in coherence:
+    violations = int(coherence["is_incoherent"].sum())
+
+agreement = None
+if not rec.empty and "reconciliation_status" in rec:
+    counts = rec["reconciliation_status"].value_counts()
+    total = int(counts.sum())
+    both = int(counts.get("BOTH", 0))
+    if total:
+        agreement = both / total
+
+
+# --------------------------------------------------------------------------- #
+# Masthead
+# --------------------------------------------------------------------------- #
+st.markdown(
+    f"""
+    <div class="masthead">
+      <div class="eyebrow">Real-time market-integrity monitoring</div>
+      <h1>Prediction-Market Surveillance
+        <span class="live-pill"><span class="live-dot"></span>LIVE</span>
+      </h1>
+      <p>A streaming pipeline that ingests a live Polymarket feed and watches it for two things:
+      whether the data itself is trustworthy (contract validation, dead-lettering, stream-vs-batch
+      reconciliation) and whether the market is behaving coherently (outcome probabilities that
+      fail to sum to one, a classic manipulation and mispricing signal). Raw events stay on the
+      collector; only aggregated marts are published here, refreshed every 15 minutes.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# --------------------------------------------------------------------------- #
+# KPI row
+# --------------------------------------------------------------------------- #
+def kpi(col, label, value, sub, tone=""):
+    col.markdown(
+        f'<div class="kpi"><div class="label">{label}</div>'
+        f'<div class="value {tone}">{value}</div>'
+        f'<div class="sub">{sub}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+k1, k2, k3, k4 = st.columns(4)
+kpi(k1, "Valid events", f"{valid:,}", "contract-validated and persisted")
+kpi(k2, "Contract reject rate", f"{reject_rate * 100:.1f}%",
+    f"{dlq:,} dead-lettered", tone="good" if reject_rate < 0.02 else "warn")
+kpi(k3, "Coherence violations", f"{violations:,}",
+    "outcomes not summing to ~1", tone="good" if violations == 0 else "bad")
+kpi(k4, "Stream-batch agreement",
+    f"{agreement * 100:.1f}%" if agreement is not None else "—",
+    "records matched across paths",
+    tone="good" if (agreement or 0) >= 0.99 else "warn")
+
+
+# --------------------------------------------------------------------------- #
+# Data-health row: reject reasons + reconciliation
+# --------------------------------------------------------------------------- #
+left, right = st.columns(2)
+
+with left:
+    st.markdown('<div class="section-title">Why records were rejected</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-note">Dead-letter reasons from the streaming contract check.</div>',
+                unsafe_allow_html=True)
+    if not reasons.empty:
+        d = reasons.sort_values(reasons.columns[1], ascending=True)
+        fig = go.Figure(go.Bar(
+            x=d[d.columns[1]], y=d["reject_reason"], orientation="h",
+            marker_color=AMBER, marker_line_width=0,
+        ))
+        st.plotly_chart(plotly_shell(fig, height=260), use_container_width=True)
+    else:
+        st.caption("No rejects in the current window - the live contract is holding.")
+
+with right:
+    st.markdown('<div class="section-title">Stream vs batch reconciliation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-note">Did the real-time path agree with the batch re-computation?</div>',
+                unsafe_allow_html=True)
+    if not rec.empty:
+        rc = rec["reconciliation_status"].value_counts().reset_index()
+        rc.columns = ["status", "n"]
+        palette = {"BOTH": GREEN, "STREAM_ONLY": AMBER, "BATCH_ONLY": RED}
+        fig = go.Figure(go.Bar(
+            x=rc["status"], y=rc["n"],
+            marker_color=[palette.get(s, BLUE) for s in rc["status"]],
+            marker_line_width=0,
+        ))
+        st.plotly_chart(plotly_shell(fig, height=260), use_container_width=True)
+    else:
+        st.caption("Reconciliation pending the next batch cycle.")
+
+
+# --------------------------------------------------------------------------- #
+# Surveillance: coherence
+# --------------------------------------------------------------------------- #
+st.markdown('<div class="section-title">Market coherence - the surveillance signal</div>',
+            unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-note">In a well-formed market, the outcome probabilities sum to ~1. '
+    'Persistent deviation flags stale quotes, thin books, or possible manipulation.</div>',
+    unsafe_allow_html=True,
+)
+
+if not coherence.empty and violations > 0:
+    bad = coherence[coherence["is_incoherent"]].copy()
+    if "minute" in bad and "deviation" in bad:
+        fig = go.Figure(go.Scatter(
+            x=bad["minute"], y=bad["deviation"], mode="markers",
+            marker=dict(size=7, color=bad["deviation"].abs(), colorscale="YlOrRd",
+                        showscale=False, line=dict(width=0)),
+        ))
+        fig.add_hline(y=0, line_color=BORDER, line_width=1)
+        fig.update_yaxes(title_text="sum(outcomes) - 1")
+        st.plotly_chart(plotly_shell(fig, height=280), use_container_width=True)
+
+    show = bad.sort_values("minute", ascending=False).head(50)
+    cols = [c for c in ["market_id", "minute", "outcome_sum", "deviation"] if c in show]
     st.dataframe(
-        cal.sort_values("brier_score", ascending=False)
-           .head(50)[["market_id", "outcome", "final_price", "won", "brier_score"]],
-        use_container_width=True,
+        show[cols].style.format({"outcome_sum": "{:.4f}", "deviation": "{:+.4f}"})
+                        .background_gradient(subset=["deviation"], cmap="RdYlGn_r"),
+        use_container_width=True, hide_index=True,
     )
 else:
-    st.caption("No resolved markets scored yet (resolutions accumulate over days).")
+    st.caption("No coherence violations in the current window. Markets are summing cleanly.")
+
+
+# --------------------------------------------------------------------------- #
+# Calibration
+# --------------------------------------------------------------------------- #
+st.markdown('<div class="section-title">Calibration vs real resolutions</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-note">Once markets resolve, how close were the prices to the truth? '
+    'Brier score, lower is better.</div>',
+    unsafe_allow_html=True,
+)
+
+if not cal.empty and "brier_score" in cal:
+    m1, _ = st.columns([1, 3])
+    kpi(m1, "Mean Brier score", f"{cal['brier_score'].mean():.4f}",
+        f"over {len(cal):,} resolved outcomes")
+    detail_cols = [c for c in ["market_id", "outcome", "final_price", "won", "brier_score"] if c in cal]
+    st.dataframe(
+        cal.sort_values("brier_score", ascending=False).head(50)[detail_cols]
+           .style.format({"final_price": "{:.3f}", "brier_score": "{:.4f}"}),
+        use_container_width=True, hide_index=True,
+    )
+else:
+    st.caption("No resolved markets scored yet - resolutions accumulate over days.")
+
+
+# --------------------------------------------------------------------------- #
+# Footer
+# --------------------------------------------------------------------------- #
+st.markdown(
+    """
+    <div class="foot">
+      Polymarket WebSocket -> Redpanda -> PySpark Structured Streaming -> Parquet lake -> dbt marts -> S3.
+      &nbsp;&middot;&nbsp; Source: <a href="https://github.com/elaiken3/prediction-market-surveillance" target="_blank">github.com/elaiken3/prediction-market-surveillance</a>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
