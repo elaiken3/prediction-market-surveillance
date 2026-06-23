@@ -9,7 +9,7 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/prediction-market-surveillance}"
-WITH_TAILSCALE="${WITH_TAILSCALE:-0}"
+WITH_TAILSCALE="${WITH_TAILSCALE:-1}"
 
 echo "==> Installing Docker (if absent)"
 if ! command -v docker >/dev/null 2>&1; then
