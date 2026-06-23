@@ -16,7 +16,7 @@ card network.
 
 ```
   Polymarket market WS ─┐
- (public, no auth)      │ normalise → canonical MarketEvent
+ (public, no auth)      │ normalize → canonical MarketEvent
   synthetic generator ──┘            │
  (offline fallback)                  ▼
                           ┌──────────────┐  markets.events
