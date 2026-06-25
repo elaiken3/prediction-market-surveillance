@@ -1,0 +1,270 @@
+# CLAUDE.md: Prediction-Market Surveillance
+
+Context and operating guide for working on this repository in Claude Code. Read this first.
+Repo: https://github.com/elaiken3/prediction-market-surveillance (public)
+
+---
+
+## 1. What this project is
+
+A real-time surveillance pipeline over a live Polymarket feed. It treats a prediction
+market the way a bank treats a transaction stream it must supervise: enforce a data
+contract on every message, never silently drop a bad one, detect dislocations and
+manipulation footprints in real time, and prove the stream told the truth by reconciling
+it against a batch recomputation and against how markets actually resolved.
+
+Two separate jobs, kept deliberately distinct:
+1. **Data integrity**: is every message well-formed and trustworthy?
+2. **Surveillance**: given trustworthy data, is the market behaving coherently?
+
+---
+
+## 2. Architecture (data flow)
+
+```
+Polymarket WebSocket (or synthetic generator fallback)
+  → normalize to canonical MarketEvent
+  → Redpanda (Kafka-compatible)   topics: markets.events, markets.dlq
+  → PySpark Structured Streaming  (validate vs JSON contract; dead-letter rejects;
+                                   windowed price-range / volume detections)
+  → date-partitioned Parquet lake (zones: valid / dlq / flagged / resolutions)
+  → dbt marts on DuckDB           (local target builds warehouse.duckdb)
+  → publish_marts.py exports marts → Parquet
+  → S3 (public-read)              s3://pms-marts-elaiken3/marts/*.parquet
+  → Streamlit dashboard           reads Parquet from S3 over HTTPS
+```
+
+The serving layer (dashboard) depends on **nothing live**. It reads static Parquet from
+S3. The collector can be dead and the dashboard still serves the last good data. This is
+intentional and hard-won (see §9).
+
+---
+
+## 3. Repo layout
+
+```
+contracts/market_event.schema.json   The data contract (JSON schema) every event is validated against
+ingestion/
+  polymarket_ws.py                   WebSocket client → normalized events → Redpanda
+  normalize.py                       Raw update → canonical MarketEvent (contract shape)
+  synthetic.py                       Offline synthetic event generator (fallback / tests)
+  fetch_resolutions.py               Pulls resolved-market outcomes (for calibration)
+  seed_lake.py                       Seeds empty lake zones so dbt never fails on missing paths
+  seed_resolutions.py                Seeds resolution data
+  publish_marts.py                   Exports dbt marts from warehouse.duckdb → data/marts/*.parquet
+streaming/
+  spark_job.py                       PySpark Structured Streaming job (the heart of ingest)
+  validate.py                        Contract validation + dead-letter routing
+  detectors.py                       Windowed price-range / volume anomaly detectors
+dbt/market_surveillance/
+  models/staging/stg_market_events.sql
+  models/marts/                      fct_ingest_summary, fct_dead_letter_reasons, fct_coherence,
+                                     fct_calibration, fct_price_minutely, fct_volume_anomalies,
+                                     fct_flagged_recent
+  models/reconciliation/rec_stream_vs_batch.sql
+  profiles.example.yml               dbt profile template
+dashboard/
+  app.py                             Local dashboard (reads local DuckDB)
+  cloud_app.py                       LEGACY: MotherDuck-backed dashboard (no longer used)
+  s3_app.py                          CURRENT public dashboard (reads Parquet from S3), finance-terminal theme
+  requirements.txt                   Streamlit Cloud deps
+deploy/
+  Dockerfile                         Batch/ingestion image (pins duckdb==1.5.3)
+  Dockerfile.spark                   Spark image
+  docker-compose.vm.yml              Production compose (redpanda, ingestion, spark-stream, dashboard, batch, topic-init)
+  bootstrap.sh                       One-shot VM provisioner (Docker, Tailscale, systemd units)
+  surveillance.service               systemd: runs the streaming stack
+  dbt-batch.service / .timer         systemd: builds marts + publishes to S3 every 15 min
+  publish_to_s3.sh                   Host step: aws s3 sync data/marts → S3
+  profiles.yml                       dbt profile used on the VM
+.streamlit/config.toml               Dark finance theme for the dashboard
+tests/                               pytest: test_validate, test_normalize, test_detectors (24 tests)
+airflow/dags/surveillance_dag.py     Airflow DAG variant (not the primary deploy path)
+Makefile                             Local dev shortcuts
+```
+
+---
+
+## 4. Tech stack
+
+Python, PySpark 3.5.1, Redpanda (Kafka API), DuckDB, dbt-duckdb, Streamlit, Parquet,
+Docker / docker-compose, AWS EC2 + S3 + IAM, Tailscale. Dev tooling: pytest, ruff,
+uv/pyenv. MotherDuck was used earlier and has been removed from the serving path.
+
+---
+
+## 5. Local development
+
+```bash
+make up           # start Redpanda + local stack via docker-compose.yml
+make topics       # create Kafka topics
+make synth        # run synthetic event generator (offline, no network needed)
+make live         # run live Polymarket WS ingestion
+make stream       # run the Spark streaming job
+make resolutions  # fetch resolved-market outcomes
+make dbt          # build dbt marts (local DuckDB target)
+make test         # run pytest (24 tests)
+make dash         # run the local Streamlit dashboard
+make down         # stop the stack
+make clean        # tear down + clear local data
+```
+
+Convention: `DBT_TARGET=local` builds `warehouse.duckdb` locally. There is no MotherDuck
+target in the active path anymore.
+
+---
+
+## 6. Live deployment state (as of last session)
+
+**EC2 collector (the "VM"):**
+- Instance: `pms-prod-2`, id `i-05de8e049933efea0`, Ubuntu 24.04 x86_64, t3.large, 40 GB gp3
+- Region: **us-east-2**
+- Public IPv4 **changes on stop/start** (no Elastic IP). Prefer the stable Tailscale IP.
+- Tailscale IP: `100.76.72.41` (stable). Dashboard over Tailscale: `http://100.76.72.41:8501`
+- SSH key on Mac: `~/.ssh/pms-prod-2.pem` (chmod 400). User: `ubuntu`
+- Code path on box: `/opt/prediction-market-surveillance`
+- IAM role attached: `pms-s3-writer` (grants S3 put + list on the marts bucket)
+- systemd: `surveillance.service` (stack, INGEST_MODE=live, DASH_BIND=0.0.0.0),
+  `dbt-batch.timer` (every 15 min → build marts + sync to S3),
+  `lake-prune.timer` (daily → delete partitions older than 5 days; prevents disk-full wedge)
+- Env file `/opt/prediction-market-surveillance/.env.motherduck` (name is legacy) contains:
+  `DBT_TARGET=local` and `MARTS_S3_BUCKET=pms-marts-elaiken3`
+
+**S3 (the serving store):**
+- Bucket: `pms-marts-elaiken3`, region **us-east-1** (NOT us-east-2; mismatch with the VM is fine)
+- Block Public Access: OFF. Bucket policy grants public `s3:GetObject` on `marts/*`
+- Bucket uses **owner-enforced** object ownership (ACLs disabled) → do NOT use `--acl` flags
+- Public mart URL pattern:
+  `https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts/<mart>.parquet`
+
+**Public dashboard (Streamlit Community Cloud):**
+- Stable URL: **https://prediction-market-surveillance.streamlit.app/** (custom subdomain, survives app recreation)
+- Main file path: `dashboard/s3_app.py`
+- Secret (Streamlit Cloud → app settings → Secrets):
+  `marts_base_url = "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts"`
+- Auto-redeploys on push to `main`.
+
+---
+
+## 7. Common runbooks
+
+**SSH to the VM:**
+```bash
+ssh -i ~/.ssh/pms-prod-2.pem ubuntu@100.76.72.41        # stable Tailscale IP
+# or use the current Public IPv4 from the EC2 console if Tailscale is down
+```
+
+**Manually refresh marts + publish to S3:**
+```bash
+cd /opt/prediction-market-surveillance
+sudo systemctl start dbt-batch.service
+journalctl -u dbt-batch.service --no-pager | tail -15   # want PASS=18 ERROR=0, then "synced marts to s3://..."
+aws s3 ls s3://pms-marts-elaiken3/marts/
+```
+
+**Rebuild the batch image after a code change to ingestion/dbt:**
+```bash
+docker compose -f deploy/docker-compose.vm.yml build batch
+```
+Force a clean rebuild (when a pinned dep isn't taking): add `--no-cache`.
+
+**Bring the whole stack up:**
+```bash
+sudo systemctl start surveillance.service
+docker compose -f deploy/docker-compose.vm.yml ps        # want all services Up, redpanda healthy
+```
+
+**Verify the public serving path:**
+```bash
+curl -sI "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts/fct_ingest_summary.parquet" | head -1
+# want: HTTP/1.1 200 OK
+```
+
+**Deploy a code change (always from the Mac, never the VM):**
+```bash
+# on Mac
+git add -A && git commit -m "..." && git push
+# on VM
+cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard origin/main
+# (reset --hard because the VM is a deploy target, not a dev checkout; .env.motherduck is gitignored and survives)
+```
+
+---
+
+## 8. Working conventions (important)
+
+- **Everything lives in version control.** Infra, systemd units, migrations, pipeline logic.
+  Anything outside source control is bad practice, not a preference.
+- **Git pushes only from the Mac.** The VM has no GitHub credentials and should not get any
+  (it's a throwaway box). Pull/reset on the VM, never push from it.
+- **Surgical fixes over rewrites.** Change only what's necessary; verify the change is isolated.
+- **Pin versions across boundaries you don't control.** `duckdb==1.5.3` is pinned in the
+  Dockerfile and dashboard requirements for exactly this reason.
+- **Writing style** (commits, PRs, docs, articles): no em dashes, US spelling, concise and
+  high-signal, change-focused commit messages that explain the *reason* not just the *what*.
+- Architecture docs are framed as north-star vision, not mandates, to ease stakeholder buy-in.
+
+---
+
+## 9. Gotchas and war stories (read before debugging deploy issues)
+
+- **A full disk silently kills sshd.** When `/` fills, sshd fails with no clear error and you
+  lose all access (SSH, Instance Connect, serial). The `lake-prune.timer` exists to prevent
+  this. If a box becomes unreachable on every path, suspect a full disk first.
+- **`sudo` strips environment variables.** `WITH_TAILSCALE=1 sudo bash bootstrap.sh` does NOT
+  pass the var through (sudo strips it). The bootstrap now defaults `WITH_TAILSCALE=1` so
+  Tailscale installs by default. Pattern lesson: bootstrap scripts must default their env vars.
+- **DuckDB version pin.** MotherDuck only supported duckdb ≤ 1.5.3; an unpinned duckdb floated
+  to 1.5.4 and broke everything. MotherDuck is now out of the path, but the pin stays as
+  defensive practice. Pinned in `deploy/Dockerfile` AND `dashboard/requirements.txt`.
+- **S3 owner-enforced ACLs.** The bucket has ACLs disabled, so `aws s3 cp/sync --acl public-read`
+  fails with `AccessControlListNotSupported`. Public read is granted via a **bucket policy**, not
+  per-object ACLs. Never reintroduce `--acl` flags.
+- **Bucket region ≠ VM region.** Bucket is in **us-east-1**, VM in us-east-2. The dashboard URL
+  must use the bucket's real region or S3 returns `301 Moved Permanently`. Confirm with
+  `aws s3api get-bucket-location --bucket pms-marts-elaiken3` (null = us-east-1).
+- **EC2 public IP changes on stop/start.** Use the Tailscale IP (`100.76.72.41`) for stable
+  access, or pull the current Public IPv4 from the console each time.
+- **Streamlit can't change the main file path** on an existing app, you must delete and
+  recreate, which changes the URL. A **custom subdomain** (already set:
+  `prediction-market-surveillance`) makes the URL survive recreation. Don't lose it.
+- **Zero reject rate is ambiguous.** A clean dead-letter path can mean the contract is healthy
+  OR that it has quietly stopped firing. Keep dead-letter reasons visible; periodically feed a
+  known-bad event to confirm the path still fires.
+
+---
+
+## 10. Open / pending work
+
+- [ ] **Commit `matplotlib>=3.7` to `dashboard/requirements.txt`.** The redesigned `s3_app.py`
+      uses `Styler.background_gradient`, which needs matplotlib; without it the dashboard throws
+      an ImportError on the coherence/calibration tables. (Highest priority: dashboard is
+      currently erroring on those tables until this lands.)
+- [ ] Confirm `dashboard/requirements.txt` has the duckdb pin committed (was not in an earlier commit).
+- [ ] Publish the Medium deep-dive series (5 parts drafted) and swap the placeholder inter-part
+      links for real Medium URLs.
+- [ ] Calibration mart needs multi-day uptime to populate as markets resolve.
+- [ ] Future: weight the coherence signal by book depth/liquidity to separate "thin and stale"
+      from "actively pushed."
+- [ ] Future: real alerting path for anomaly detections (currently passive dashboard only).
+- [ ] Cost hygiene: stop the EC2 instance when not actively collecting (only EBS ~$3-4/mo when stopped).
+
+---
+
+## 11. Key marts (what each answers)
+
+| Mart | Question it answers |
+|------|---------------------|
+| `fct_ingest_summary` | Can I trust the feed? (valid count, dlq count, reject rate) |
+| `fct_dead_letter_reasons` | When I can't, why not? |
+| `fct_coherence` | Is the market internally consistent? (Σ outcomes vs 1) |
+| `rec_stream_vs_batch` | Did the real-time path agree with batch recomputation? |
+| `fct_calibration` | Was the market actually right, once resolved? (Brier score) |
+| `fct_price_minutely` | Minutely price series per market/outcome |
+| `fct_volume_anomalies` | Volume spikes vs normal activity |
+| `fct_flagged_recent` | Recently flagged anomalies |
+
+The dashboard (`s3_app.py`) reads five of these:
+fct_ingest_summary, fct_dead_letter_reasons, fct_coherence, rec_stream_vs_batch, fct_calibration.
+If you add a mart to the dashboard, also add it to the `MARTS` list in `ingestion/publish_marts.py`
+so it gets exported to S3.
