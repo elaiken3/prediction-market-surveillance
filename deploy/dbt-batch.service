@@ -5,9 +5,14 @@ Requires=docker.service
 After=surveillance.service
 
 [Service]
-# Optional: a gitignored env file can set DBT_TARGET=motherduck and MOTHERDUCK_TOKEN
-# to publish marts to MotherDuck. Absent -> the compose default (local) is used.
+# The gitignored env file supplies MARTS_S3_BUCKET (required by the S3 sync
+# post-step) and DBT_TARGET. Absent -> the compose default (local) is used.
 EnvironmentFile=-/opt/prediction-market-surveillance/.env.motherduck
 Type=oneshot
 WorkingDirectory=/opt/prediction-market-surveillance
 ExecStart=/usr/bin/docker compose -f deploy/docker-compose.vm.yml run --rm batch
+# Publish the freshly built marts to S3 (the serving store the dashboard reads).
+# Runs on the host, not in the batch container, because it relies on the EC2
+# instance role for AWS creds. Without this the marts only ever reach the local
+# data/marts dir and the dashboard silently goes stale.
+ExecStartPost=/usr/bin/bash /opt/prediction-market-surveillance/deploy/publish_to_s3.sh
