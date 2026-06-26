@@ -11,7 +11,10 @@ export PATH="$PATH:/snap/bin"
 : "${MARTS_S3_BUCKET:?set MARTS_S3_BUCKET in the batch env file}"
 DIR="/opt/prediction-market-surveillance/data/marts"
 if [ -d "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
-  aws s3 sync "$DIR" "s3://${MARTS_S3_BUCKET}/marts/" --acl public-read --no-progress
+  # No --acl flag: the bucket is owner-enforced (ACLs disabled), so --acl
+  # public-read fails with AccessControlListNotSupported. Public read is
+  # granted by the bucket policy on marts/*, not per-object ACLs.
+  aws s3 sync "$DIR" "s3://${MARTS_S3_BUCKET}/marts/" --no-progress
   echo "synced marts to s3://${MARTS_S3_BUCKET}/marts/"
 else
   echo "no marts to sync (empty $DIR)"
