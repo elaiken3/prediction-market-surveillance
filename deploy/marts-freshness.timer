@@ -1,0 +1,13 @@
+# /etc/systemd/system/marts-freshness.timer
+[Unit]
+Description=Check marts freshness every 15 minutes
+
+[Timer]
+# Offset past the batch's own boot run (dbt-batch OnBootSec=5min) so the first
+# check sees a freshly published mart, not a cold-start lag.
+OnBootSec=12min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

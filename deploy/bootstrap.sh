@@ -32,12 +32,15 @@ if [ "$WITH_TAILSCALE" = "1" ]; then
 fi
 
 echo "==> Installing systemd units"
-install -m 0644 "$APP_DIR/deploy/surveillance.service" /etc/systemd/system/surveillance.service
-install -m 0644 "$APP_DIR/deploy/dbt-batch.service"   /etc/systemd/system/dbt-batch.service
-install -m 0644 "$APP_DIR/deploy/dbt-batch.timer"     /etc/systemd/system/dbt-batch.timer
+install -m 0644 "$APP_DIR/deploy/surveillance.service"    /etc/systemd/system/surveillance.service
+install -m 0644 "$APP_DIR/deploy/dbt-batch.service"      /etc/systemd/system/dbt-batch.service
+install -m 0644 "$APP_DIR/deploy/dbt-batch.timer"        /etc/systemd/system/dbt-batch.timer
+install -m 0644 "$APP_DIR/deploy/marts-freshness.service" /etc/systemd/system/marts-freshness.service
+install -m 0644 "$APP_DIR/deploy/marts-freshness.timer"   /etc/systemd/system/marts-freshness.timer
 systemctl daemon-reload
 systemctl enable surveillance.service
 systemctl enable --now dbt-batch.timer
+systemctl enable --now marts-freshness.timer
 
 cat <<'NEXT'
 

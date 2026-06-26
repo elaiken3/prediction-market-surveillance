@@ -1,0 +1,11 @@
+# /etc/systemd/system/marts-freshness.service  (run by marts-freshness.timer)
+[Unit]
+Description=Alert if the published marts on S3 have gone stale
+
+[Service]
+# Supplies MARTS_S3_BUCKET, and optionally MARTS_MAX_AGE_SECONDS /
+# FRESHNESS_ALERT_WEBHOOK to tune the threshold and wire an external notifier.
+EnvironmentFile=-/opt/prediction-market-surveillance/.env.motherduck
+Type=oneshot
+WorkingDirectory=/opt/prediction-market-surveillance
+ExecStart=/usr/bin/bash /opt/prediction-market-surveillance/deploy/check_marts_fresh.sh
