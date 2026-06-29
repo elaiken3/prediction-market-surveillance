@@ -25,7 +25,7 @@ set -euo pipefail
 export PATH="$PATH:/snap/bin"   # in case aws is a snap install
 
 INSTANCE_ID="${INSTANCE_ID:-i-05de8e049933efea0}"   # pms-prod-2
-REGION="${REGION:-us-east-2}"
+REGION="${REGION:-us-east-1}"
 ALARM_NAME="${ALARM_NAME:-pms-prod-2-autoreboot}"
 
 aws cloudwatch put-metric-alarm \
