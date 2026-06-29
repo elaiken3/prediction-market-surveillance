@@ -123,7 +123,8 @@ target in the active path anymore.
 
 **EC2 collector (the "VM"):**
 - Instance: `pms-prod-2`, id `i-05de8e049933efea0`, Ubuntu 24.04 x86_64, t3.large, 40 GB gp3
-- Region: **us-east-2**
+- Region: **us-east-1** (AZ us-east-1d). Confirm from the box via IMDS:
+  `TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60"); curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region`
 - Public IPv4 **changes on stop/start** (no Elastic IP). Prefer the stable Tailscale IP.
 - Tailscale IP: `100.76.72.41` (stable). Dashboard over Tailscale: `http://100.76.72.41:8501`
 - SSH key on Mac: `~/.ssh/pms-prod-2.pem` (chmod 400). User: `ubuntu`
@@ -149,7 +150,7 @@ target in the active path anymore.
   deliberate stop windows — raise the threshold or disable the workflow for long stops.
 
 **S3 (the serving store):**
-- Bucket: `pms-marts-elaiken3`, region **us-east-1** (NOT us-east-2; mismatch with the VM is fine)
+- Bucket: `pms-marts-elaiken3`, region **us-east-1** (same region as the VM)
 - Block Public Access: OFF. Bucket policy grants public `s3:GetObject` on `marts/*`
 - Bucket uses **owner-enforced** object ownership (ACLs disabled) → do NOT use `--acl` flags
 - Public mart URL pattern:
@@ -300,9 +301,11 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   AWS-side ENI/VPC blip vs. a local cause, check the instance Status-checks history and the AWS Health
   Dashboard for the failure window. Lesson: when a box is "down" but its disk/journal survive, read the
   prior boot's logs and trust the ENETUNREACH signature over the noisiest logger (tailscale).
-- **Bucket region ≠ VM region.** Bucket is in **us-east-1**, VM in us-east-2. The dashboard URL
-  must use the bucket's real region or S3 returns `301 Moved Permanently`. Confirm with
-  `aws s3api get-bucket-location --bucket pms-marts-elaiken3` (null = us-east-1).
+- **Use the bucket's real region in the dashboard URL.** Both the bucket and the VM are in
+  **us-east-1**, but the dashboard URL still must name the bucket's region explicitly or S3 returns
+  `301 Moved Permanently`. Confirm with `aws s3api get-bucket-location --bucket pms-marts-elaiken3`
+  (null = us-east-1). (An earlier version of this file claimed the VM was in us-east-2; IMDS says
+  us-east-1. Trust IMDS / the SSM endpoint in the logs over the doc.)
 - **EC2 public IP changes on stop/start.** Use the Tailscale IP (`100.76.72.41`) for stable
   access, or pull the current Public IPv4 from the console each time.
 - **Streamlit can't change the main file path** on an existing app, you must delete and
@@ -334,7 +337,7 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
       disable the workflow for long stop windows.
 - [ ] Apply the auto-reboot alarm (`deploy/setup_autoreboot_alarm.sh`) for the recurring "lost network
       but powered" failure (§9). Run it from the Mac (the VM's `pms-s3-writer` role has no CloudWatch
-      perms) and in `us-east-2` (the alarm must match the instance region). If reboots do not clear it,
+      perms) and in `us-east-1` (the alarm must match the instance region). If reboots do not clear it,
       open an AWS support/Health case for an ENI/VPC-side cause.
 
 **Resolved this session (was: dashboard serving stale data):** wired the S3 sync into `dbt-batch`

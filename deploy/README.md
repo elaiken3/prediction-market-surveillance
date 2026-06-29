@@ -88,7 +88,7 @@ on `StatusCheckFailed_Instance` (a reboot re-runs DHCP and restores the route).
 
 ```bash
 # run from the Mac (admin creds), NOT the VM (its role is S3-only):
-bash deploy/setup_autoreboot_alarm.sh        # defaults: pms-prod-2, us-east-2
+bash deploy/setup_autoreboot_alarm.sh        # defaults: pms-prod-2, us-east-1
 ```
 
 The action is `ec2:reboot`, not `ec2:recover`: AWS's recover action only fires on
