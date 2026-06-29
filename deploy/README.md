@@ -78,6 +78,24 @@ Because the off-box monitor can't tell a deliberate cost-saving stop from a real
 outage, it will fire during long deliberate stops — raise the threshold or disable
 the workflow for those windows.
 
+## Auto-recovery (the box loses its network but stays powered)
+
+This collector has twice lost its default route while still running (interface up,
+but no route out: SSH dead, instance status check red, publish frozen, journal
+still logging). It is not a resource issue, so the fix is automated recovery:
+`setup_autoreboot_alarm.sh` creates a CloudWatch alarm that force-reboots the box
+on `StatusCheckFailed_Instance` (a reboot re-runs DHCP and restores the route).
+
+```bash
+# run from the Mac (admin creds), NOT the VM (its role is S3-only):
+bash deploy/setup_autoreboot_alarm.sh        # defaults: pms-prod-2, us-east-2
+```
+
+The action is `ec2:reboot`, not `ec2:recover`: AWS's recover action only fires on
+*system* status-check failures, and these are *instance* check failures. The
+off-box freshness monitor still emails you when it happens, so a silent auto-bounce
+is still visible.
+
 ## Going further
 
 - **Public dashboard:** point dbt at MotherDuck (swap the `local` profile target)
