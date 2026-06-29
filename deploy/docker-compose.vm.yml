@@ -135,7 +135,7 @@ services:
         python -c "import duckdb, os; duckdb.connect('md:?motherduck_token=' + os.environ['MOTHERDUCK_TOKEN']).execute('CREATE DATABASE IF NOT EXISTS market_surveillance')";
         fi;
         python -m ingestion.seed_lake --lake /app/data/lake &&
-        python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 &&
+        { python -m ingestion.fetch_resolutions --lake /app/data/lake --limit 200 || echo "WARN: resolutions fetch failed (network/DNS); continuing with existing/seeded resolutions"; } &&
         cd dbt/market_surveillance &&
         dbt deps &&
         dbt build --target "$$DBT_TARGET" --vars '{lake_path: /app/data/lake}' &&
