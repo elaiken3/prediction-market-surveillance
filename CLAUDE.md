@@ -79,6 +79,7 @@ deploy/
   check_marts_fresh.sh               Freshness probe: non-zero exit if newest S3 mart older than threshold
   marts-freshness.service / .timer   systemd: runs check_marts_fresh.sh every 15 min (on-box staleness alarm)
   lake-prune.service / .timer        systemd: daily prune of lake partitions older than 5 days (disk-full guard)
+  setup_autoreboot_alarm.sh          Creates a CloudWatch alarm to force-reboot the box on instance status-check fail
   profiles.yml                       dbt profile used on the VM
 .github/workflows/marts-freshness.yml  Off-box monitor: GitHub Actions cron curls S3 Last-Modified, fails the job if stale
 .streamlit/config.toml               Dark finance theme for the dashboard
@@ -282,6 +283,23 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - **On-box monitoring can't see a dead box.** `marts-freshness.timer` only runs while the instance is
   up, so a stopped/wedged box produces no alarm from it. The off-box GitHub Actions monitor covers that
   blind spot. Conversely it cannot distinguish a deliberate cost-saving stop from a real outage.
+- **The box loses its network but stays powered (recurring).** Twice the publish froze while the
+  instance was still running: SSH dead, instance status check red, but `journald` kept logging locally.
+  The trap is that this looks like every other failure. Diagnosis ruled them out one by one from the
+  *previous* boot's logs (`journalctl --list-boots`, then `-b -2`): no OOM/`killed process` (not memory),
+  no `nvme timeout`/`hung task` (not disk), no `ena`/`ens5` reset (NIC fine at the kernel level), and the
+  only link events were `veth*` pairs cycling every 15 min (just the dbt-batch *containers*, a red
+  herring). The real signature was tailscaled `Rebind; defIf="", ips=[]` plus `connect: network is
+  unreachable` (ENETUNREACH) to real IPv4s, corroborated by SSM DNS failing and `check_marts_fresh.sh`
+  exiting 253: **the host lost its default route while the ENI stayed attached.** ENETUNREACH is a
+  routing verdict, not a throttle, so it is NOT a t3 CPU/network-credit problem (credits cause timeouts,
+  never "no route") and changing instance type would not fix it. There is no resource cause to fix, so
+  the durable answer is automated recovery: `deploy/setup_autoreboot_alarm.sh` sets a CloudWatch alarm
+  that force-reboots on `StatusCheckFailed_Instance` (reboot re-runs DHCP and restores the route; AWS's
+  `ec2:recover` action does NOT apply to *instance* check failures, only *system* ones). To pin an
+  AWS-side ENI/VPC blip vs. a local cause, check the instance Status-checks history and the AWS Health
+  Dashboard for the failure window. Lesson: when a box is "down" but its disk/journal survive, read the
+  prior boot's logs and trust the ENETUNREACH signature over the noisiest logger (tailscale).
 - **Bucket region ≠ VM region.** Bucket is in **us-east-1**, VM in us-east-2. The dashboard URL
   must use the bucket's real region or S3 returns `301 Moved Permanently`. Confirm with
   `aws s3api get-bucket-location --bucket pms-marts-elaiken3` (null = us-east-1).
@@ -314,6 +332,10 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - [ ] Cost hygiene: stop the EC2 instance when not actively collecting (only EBS ~$3-4/mo when stopped).
       Remember the off-box freshness monitor will fire while it is stopped; raise `MAX_AGE_MINUTES` or
       disable the workflow for long stop windows.
+- [ ] Apply the auto-reboot alarm (`deploy/setup_autoreboot_alarm.sh`) for the recurring "lost network
+      but powered" failure (§9). Run it from the Mac (the VM's `pms-s3-writer` role has no CloudWatch
+      perms) and in `us-east-2` (the alarm must match the instance region). If reboots do not clear it,
+      open an AWS support/Health case for an ENI/VPC-side cause.
 
 **Resolved this session (was: dashboard serving stale data):** wired the S3 sync into `dbt-batch`
 (`ExecStartPost`), fixed `aws`-not-on-systemd-PATH, removed the `--acl` flag, made `fetch_resolutions`
