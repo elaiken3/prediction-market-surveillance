@@ -74,9 +74,13 @@ deploy/
   docker-compose.vm.yml              Production compose (redpanda, ingestion, spark-stream, dashboard, batch, topic-init)
   bootstrap.sh                       One-shot VM provisioner (Docker, Tailscale, systemd units)
   surveillance.service               systemd: runs the streaming stack
-  dbt-batch.service / .timer         systemd: builds marts + publishes to S3 every 15 min
-  publish_to_s3.sh                   Host step: aws s3 sync data/marts → S3
+  dbt-batch.service / .timer         systemd: builds marts (ExecStart) + syncs to S3 (ExecStartPost) every 15 min
+  publish_to_s3.sh                   Host step (dbt-batch ExecStartPost): aws s3 sync data/marts → S3
+  check_marts_fresh.sh               Freshness probe: non-zero exit if newest S3 mart older than threshold
+  marts-freshness.service / .timer   systemd: runs check_marts_fresh.sh every 15 min (on-box staleness alarm)
+  lake-prune.service / .timer        systemd: daily prune of lake partitions older than 5 days (disk-full guard)
   profiles.yml                       dbt profile used on the VM
+.github/workflows/marts-freshness.yml  Off-box monitor: GitHub Actions cron curls S3 Last-Modified, fails the job if stale
 .streamlit/config.toml               Dark finance theme for the dashboard
 tests/                               pytest: test_validate, test_normalize, test_detectors (24 tests)
 airflow/dags/surveillance_dag.py     Airflow DAG variant (not the primary deploy path)
@@ -125,10 +129,23 @@ target in the active path anymore.
 - Code path on box: `/opt/prediction-market-surveillance`
 - IAM role attached: `pms-s3-writer` (grants S3 put + list on the marts bucket)
 - systemd: `surveillance.service` (stack, INGEST_MODE=live, DASH_BIND=0.0.0.0),
-  `dbt-batch.timer` (every 15 min → build marts + sync to S3),
+  `dbt-batch.timer` (every 15 min → build marts, then ExecStartPost syncs to S3),
+  `marts-freshness.timer` (every 15 min → on-box staleness alarm; goes to `failed` if S3 marts age out),
   `lake-prune.timer` (daily → delete partitions older than 5 days; prevents disk-full wedge)
 - Env file `/opt/prediction-market-surveillance/.env.motherduck` (name is legacy) contains:
-  `DBT_TARGET=local` and `MARTS_S3_BUCKET=pms-marts-elaiken3`
+  `DBT_TARGET=local` and `MARTS_S3_BUCKET=pms-marts-elaiken3`. Optional knobs the
+  freshness units read: `MARTS_MAX_AGE_SECONDS` (default 1800) and `FRESHNESS_ALERT_WEBHOOK`.
+
+**Monitoring (two layers, because each misses what the other catches):**
+- **On-box:** `marts-freshness.timer` runs `check_marts_fresh.sh`, which heads the newest mart on
+  S3 and exits non-zero if it is older than `MARTS_MAX_AGE_SECONDS`. A stale publish drives the unit
+  to `failed` (visible in `systemctl --failed`). Catches "box up but publish broken." Cannot catch a
+  dead box, because it runs on that box.
+- **Off-box:** `.github/workflows/marts-freshness.yml` runs every 30 min on GitHub's infra, curls the
+  S3 `Last-Modified`, and fails the job (GitHub emails the owner) if older than `MAX_AGE_MINUTES`
+  (default 60). Catches "whole box is down/stopped." Optional `MARTS_ALERT_SLACK_WEBHOOK` repo secret
+  posts to Slack. Note: it cannot tell "stopped for cost" from "broken," so it will fire during
+  deliberate stop windows — raise the threshold or disable the workflow for long stops.
 
 **S3 (the serving store):**
 - Bucket: `pms-marts-elaiken3`, region **us-east-1** (NOT us-east-2; mismatch with the VM is fine)
@@ -178,6 +195,17 @@ docker compose -f deploy/docker-compose.vm.yml ps        # want all services Up,
 ```bash
 curl -sI "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts/fct_ingest_summary.parquet" | head -1
 # want: HTTP/1.1 200 OK
+curl -sI "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts/fct_ingest_summary.parquet" | grep -i last-modified
+# Last-Modified should be within the last ~15 min if the box is up and publishing
+```
+
+**Run the freshness probe by hand (and prove it fires):**
+```bash
+cd /opt/prediction-market-surveillance
+sudo systemctl start marts-freshness.service                 # happy path: "marts fresh: ... Ns old"
+systemctl --failed                                           # a stale publish lands the unit here
+# force the stale branch (needs MARTS_S3_BUCKET; the env file is not auto-sourced for a manual run):
+sudo MARTS_S3_BUCKET=pms-marts-elaiken3 MARTS_MAX_AGE_SECONDS=1 bash deploy/check_marts_fresh.sh; echo "EXIT=$?"
 ```
 
 **Deploy a code change (always from the Mac, never the VM):**
@@ -188,6 +216,15 @@ git add -A && git commit -m "..." && git push
 cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard origin/main
 # (reset --hard because the VM is a deploy target, not a dev checkout; .env.motherduck is gitignored and survives)
 ```
+
+> **If the change touched a systemd unit file** (`deploy/*.service` or `*.timer`), `reset --hard`
+> alone is NOT enough: the installed copies live in `/etc/systemd/system/`, which git does not touch.
+> Reinstall and reload:
+> ```bash
+> sudo install -m 0644 deploy/<unit> /etc/systemd/system/<unit>
+> sudo systemctl daemon-reload
+> ```
+> (This bit us twice: the publish wiring and the freshness units only took effect after a reinstall.)
 
 ---
 
@@ -219,7 +256,32 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   defensive practice. Pinned in `deploy/Dockerfile` AND `dashboard/requirements.txt`.
 - **S3 owner-enforced ACLs.** The bucket has ACLs disabled, so `aws s3 cp/sync --acl public-read`
   fails with `AccessControlListNotSupported`. Public read is granted via a **bucket policy**, not
-  per-object ACLs. Never reintroduce `--acl` flags.
+  per-object ACLs. Never reintroduce `--acl` flags. (This regressed once: `publish_to_s3.sh` shipped
+  with `--acl public-read` and every sync failed silently. The flag is now gone; public read still
+  works because the bucket policy grants it.)
+- **The marts froze for days behind a green build.** The most important lesson of the whole project.
+  `dbt-batch` built marts and exported them locally, but nothing synced them to S3, so the dashboard
+  served stale Parquet while every build reported `PASS=18`. A green build is not a healthy pipeline;
+  only a fresh `Last-Modified` on S3 proves the serving store is current. This is why the two
+  freshness checks (§6 Monitoring) exist. Same family as "zero reject rate is ambiguous": success
+  metrics can mask a dead downstream.
+- **`aws` is a snap install; systemd has a minimal PATH.** `aws` lives at `/snap/bin/aws`. Interactive
+  shells get `/snap/bin` on PATH automatically, but systemd units do not, so an `ExecStartPost` calling
+  `aws` died with exit 127 "command not found" even though it ran fine by hand. `publish_to_s3.sh` and
+  `check_marts_fresh.sh` both `export PATH="$PATH:/snap/bin"` to fix this. Watch for it in any new unit.
+- **One flaky external call can abort the whole batch.** The batch command is a single `&&` chain
+  (`seed_lake && fetch_resolutions && dbt build && publish_marts`). A transient DNS failure reaching
+  the Polymarket Gamma API in `fetch_resolutions` (common right after a reboot) killed the entire chain,
+  so nothing built or published. `fetch_resolutions` only feeds calibration, so it is now wrapped to be
+  non-fatal (`{ ... || echo WARN; }`); `seed_lake` already seeds the resolutions zone so the build is
+  safe without a fresh fetch. Lesson: best-effort enrichment must not gate the core pipeline.
+- **Unit files are not deployed by `git reset --hard`.** Installed units live in `/etc/systemd/system/`;
+  the repo only holds templates. Editing `deploy/*.service` and pulling does nothing until you
+  `install` the file and `systemctl daemon-reload` (see §7). Forgetting this makes a "deployed" fix
+  silently inert.
+- **On-box monitoring can't see a dead box.** `marts-freshness.timer` only runs while the instance is
+  up, so a stopped/wedged box produces no alarm from it. The off-box GitHub Actions monitor covers that
+  blind spot. Conversely it cannot distinguish a deliberate cost-saving stop from a real outage.
 - **Bucket region ≠ VM region.** Bucket is in **us-east-1**, VM in us-east-2. The dashboard URL
   must use the bucket's real region or S3 returns `301 Moved Permanently`. Confirm with
   `aws s3api get-bucket-location --bucket pms-marts-elaiken3` (null = us-east-1).
@@ -246,8 +308,17 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - [ ] Calibration mart needs multi-day uptime to populate as markets resolve.
 - [ ] Future: weight the coherence signal by book depth/liquidity to separate "thin and stale"
       from "actively pushed."
-- [ ] Future: real alerting path for anomaly detections (currently passive dashboard only).
+- [ ] Future: real alerting path for anomaly *detections* (still passive dashboard only). Note: mart
+      *freshness* alerting now exists (on-box `marts-freshness.timer` + off-box GitHub Actions); the
+      `FRESHNESS_ALERT_WEBHOOK` / `MARTS_ALERT_SLACK_WEBHOOK` hooks are the natural place to extend it.
 - [ ] Cost hygiene: stop the EC2 instance when not actively collecting (only EBS ~$3-4/mo when stopped).
+      Remember the off-box freshness monitor will fire while it is stopped; raise `MAX_AGE_MINUTES` or
+      disable the workflow for long stop windows.
+
+**Resolved this session (was: dashboard serving stale data):** wired the S3 sync into `dbt-batch`
+(`ExecStartPost`), fixed `aws`-not-on-systemd-PATH, removed the `--acl` flag, made `fetch_resolutions`
+non-fatal to the batch, added on-box + off-box freshness monitoring, and committed the previously
+live-only `lake-prune` units. See §9 for the war stories behind each.
 
 ---
 

@@ -68,6 +68,20 @@ card network.
 | Calibration vs reality | **Batch** (dbt) | needs resolution outcomes |
 | "Did the stream lie?" | **Batch** (dbt reconcile) | compares the two paths |
 
+## Reliability: the dashboard outlives the collector
+
+The public dashboard reads **static Parquet from S3**, not a live database. The
+collector can crash, fill its disk, or be stopped for cost and the dashboard keeps
+serving the last good data instead of erroring. The batch job rebuilds the marts and
+syncs them to S3 every 15 minutes.
+
+The flip side of a decoupled serving store is that "the build passed" does not mean
+"the dashboard is fresh" — a publish can die while every build stays green. So
+freshness is monitored on two layers: an **on-box** timer that alarms when a publish
+breaks while the collector is up, and an **off-box** GitHub Actions cron that checks
+the S3 `Last-Modified` and so still fires when the whole box is down. See
+`deploy/README.md` for the operational detail.
+
 ## Quickstart
 
 ```bash
