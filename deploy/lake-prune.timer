@@ -1,0 +1,10 @@
+# /etc/systemd/system/lake-prune.timer
+[Unit]
+Description=Daily lake prune
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

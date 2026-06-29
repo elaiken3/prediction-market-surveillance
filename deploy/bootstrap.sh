@@ -37,10 +37,13 @@ install -m 0644 "$APP_DIR/deploy/dbt-batch.service"      /etc/systemd/system/dbt
 install -m 0644 "$APP_DIR/deploy/dbt-batch.timer"        /etc/systemd/system/dbt-batch.timer
 install -m 0644 "$APP_DIR/deploy/marts-freshness.service" /etc/systemd/system/marts-freshness.service
 install -m 0644 "$APP_DIR/deploy/marts-freshness.timer"   /etc/systemd/system/marts-freshness.timer
+install -m 0644 "$APP_DIR/deploy/lake-prune.service"     /etc/systemd/system/lake-prune.service
+install -m 0644 "$APP_DIR/deploy/lake-prune.timer"       /etc/systemd/system/lake-prune.timer
 systemctl daemon-reload
 systemctl enable surveillance.service
 systemctl enable --now dbt-batch.timer
 systemctl enable --now marts-freshness.timer
+systemctl enable --now lake-prune.timer
 
 cat <<'NEXT'
 

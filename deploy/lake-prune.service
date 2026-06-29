@@ -1,0 +1,12 @@
+# /etc/systemd/system/lake-prune.service  (run by lake-prune.timer)
+# Deletes date-partitioned lake folders older than 5 days. A full disk silently
+# kills sshd on this box (see CLAUDE.md s9), so this is load-bearing, not
+# housekeeping. The two zones are partitioned under different key names
+# (event_date= for valid events, rejected_date= for the dead-letter zone).
+[Unit]
+Description=Prune parquet partitions older than 5 days
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /opt/prediction-market-surveillance/data/lake -type d -name "event_date=*" -mtime +5 -exec rm -rf {} +
+ExecStartPost=/usr/bin/find /opt/prediction-market-surveillance/data/lake -type d -name "rejected_date=*" -mtime +5 -exec rm -rf {} +

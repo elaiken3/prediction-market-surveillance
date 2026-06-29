@@ -1,0 +1,68 @@
+# Off-box freshness monitor for the published marts.
+#
+# The on-VM marts-freshness.timer only runs while the box is up, so it cannot
+# catch an outage where the whole instance is down (stopped for cost, wedged,
+# or failed to boot). This workflow runs on GitHub's infrastructure, independent
+# of the VM, and checks the same thing the dashboard reads: the Last-Modified of
+# the marts on S3. If the newest mart is older than MAX_AGE_MINUTES it fails the
+# job, and GitHub emails the repo owner on a failed scheduled run (zero config).
+# Set the optional MARTS_ALERT_SLACK_WEBHOOK repo secret to also post to Slack.
+#
+# Note: the EC2 collector is sometimes stopped deliberately for cost. While it is
+# stopped the marts will age and this monitor will (correctly) fire. If you stop
+# the box for long stretches, either raise MAX_AGE_MINUTES or disable this
+# workflow for that window.
+name: marts-freshness
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min (scheduled runs can lag under load)
+  workflow_dispatch: {}       # allow a manual run to test
+
+env:
+  MARTS_BASE_URL: "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts"
+  CANARY_MART: "fct_ingest_summary.parquet"   # always built + exported
+  MAX_AGE_MINUTES: "60"                        # 4 missed 15-min publish cycles
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check mart freshness on S3
+        run: |
+          set -euo pipefail
+          url="${MARTS_BASE_URL}/${CANARY_MART}"
+
+          last_modified="$(curl -sSI "$url" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r')"
+          if [ -z "$last_modified" ]; then
+            echo "::error::No Last-Modified header from $url (object missing or S3 unreachable)"
+            exit 1
+          fi
+
+          last_epoch="$(date -d "$last_modified" +%s)"
+          age_sec=$(( $(date +%s) - last_epoch ))
+          age_min=$(( age_sec / 60 ))
+          max_sec=$(( MAX_AGE_MINUTES * 60 ))
+
+          echo "Canary mart: $CANARY_MART"
+          echo "Last-Modified: $last_modified"
+          echo "Age: ${age_min} min (threshold ${MAX_AGE_MINUTES} min)"
+          {
+            echo "### marts-freshness"
+            echo "- Mart: \`${CANARY_MART}\`"
+            echo "- Last-Modified: ${last_modified}"
+            echo "- Age: **${age_min} min** (threshold ${MAX_AGE_MINUTES} min)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$age_sec" -gt "$max_sec" ]; then
+            msg="STALE marts: ${CANARY_MART} is ${age_min} min old (max ${MAX_AGE_MINUTES}). The publish path may be down or the collector box stopped."
+            echo "::error::${msg}"
+            if [ -n "${MARTS_ALERT_SLACK_WEBHOOK:-}" ]; then
+              curl -fsS -X POST -H 'Content-Type: application/json' \
+                -d "{\"text\": \"${msg}\"}" "$MARTS_ALERT_SLACK_WEBHOOK" || true
+            fi
+            exit 1
+          fi
+          echo "marts are fresh."
+        env:
+          MARTS_ALERT_SLACK_WEBHOOK: ${{ secrets.MARTS_ALERT_SLACK_WEBHOOK }}
