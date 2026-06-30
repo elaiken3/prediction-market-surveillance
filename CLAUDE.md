@@ -342,14 +342,14 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 
 ## 10. Open / pending work
 
-- [ ] **Commit `matplotlib>=3.7` to `dashboard/requirements.txt`.** The redesigned `s3_app.py`
-      uses `Styler.background_gradient`, which needs matplotlib; without it the dashboard throws
-      an ImportError on the coherence/calibration tables. (Highest priority: dashboard is
-      currently erroring on those tables until this lands.)
-- [ ] Confirm `dashboard/requirements.txt` has the duckdb pin committed (was not in an earlier commit).
+- [x] `matplotlib>=3.7` and the `duckdb==1.5.3` pin are both in `dashboard/requirements.txt`.
 - [ ] Publish the Medium deep-dive series (5 parts drafted) and swap the placeholder inter-part
       links for real Medium URLs.
-- [ ] Calibration mart needs multi-day uptime to populate as markets resolve.
+- [ ] Calibration populates only when a *tracked* market resolves, so its time-to-first-data is gated
+      by those markets' end dates. `polymarket_ws` picks high-volume markets, which skew long-dated, so
+      empty calibration can be expected for a while. `fetch_resolutions` now paginates a wider window
+      and filters to tracked market_ids (so a resolution can't slip past the old limit-200). To *demo*
+      calibration sooner, deliberately track some short-horizon markets.
 - [ ] Future: weight the coherence signal by book depth/liquidity to separate "thin and stale"
       from "actively pushed."
 - [ ] Future: real alerting path for anomaly *detections* (still passive dashboard only). Note: mart
@@ -383,7 +383,12 @@ live-only `lake-prune` units. See §9 for the war stories behind each.
 | `fct_volume_anomalies` | Volume spikes vs normal activity |
 | `fct_flagged_recent` | Recently flagged anomalies |
 
-The dashboard (`s3_app.py`) reads five of these:
-fct_ingest_summary, fct_dead_letter_reasons, fct_coherence, rec_stream_vs_batch, fct_calibration.
-If you add a mart to the dashboard, also add it to the `MARTS` list in `ingestion/publish_marts.py`
-so it gets exported to S3.
+The dashboard (`s3_app.py`) reads seven of these:
+fct_ingest_summary, fct_dead_letter_reasons, fct_coherence, rec_stream_vs_batch, fct_calibration,
+fct_flagged_recent, fct_volume_anomalies. If you add a mart to the dashboard, also add it to the
+`MARTS` list in `ingestion/publish_marts.py` so it gets exported to S3.
+
+The dashboard masthead shows a **freshness pill** driven by the S3 `Last-Modified` of the canary mart
+(green <=30 min, amber <=90, red beyond): the visible signal that was missing when stale data looked
+"LIVE". The stream-batch tile is scored over the **last 48h only** (`REC_WINDOW_HOURS`), because a
+lifetime count is polluted by orphaned old flags after pruning (see §9 reconciliation note).

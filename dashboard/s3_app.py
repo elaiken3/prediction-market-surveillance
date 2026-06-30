@@ -11,7 +11,10 @@ Locally you can instead set the env var MARTS_BASE_URL.
 """
 from __future__ import annotations
 
+import datetime
+import email.utils
 import os
+import urllib.request
 
 import duckdb
 import pandas as pd
@@ -130,6 +133,44 @@ def mart(name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=60)
+def marts_age_minutes() -> float | None:
+    """Age of the published marts, from the S3 object's Last-Modified header.
+
+    This is the one honest freshness signal: a green build that never reaches S3
+    leaves this old (the failure that froze this dashboard for days). The badge
+    turns red so silent staleness can never look LIVE again.
+    """
+    try:
+        req = urllib.request.Request(f"{BASE}/fct_ingest_summary.parquet", method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310
+            lm = r.headers.get("Last-Modified")
+        if not lm:
+            return None
+        dt = email.utils.parsedate_to_datetime(lm)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - dt).total_seconds() / 60.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def freshness_pill() -> str:
+    age = marts_age_minutes()
+    if age is None:
+        color, label = MUTED, "DATA AGE UNKNOWN"
+    elif age <= 30:
+        color, label = GREEN, f"LIVE &middot; {int(age)}m ago"
+    elif age <= 90:
+        color, label = AMBER, f"{int(age)}m old"
+    else:
+        color, label = RED, f"STALE &middot; {age / 60:.1f}h old"
+    return (
+        f'<span class="live-pill" style="color:{color}">'
+        f'<span class="live-dot" style="background:{color};box-shadow:0 0 6px {color}"></span>'
+        f"{label}</span>"
+    )
+
+
 def plotly_shell(fig: go.Figure, height: int = 300) -> go.Figure:
     fig.update_layout(
         template="plotly_dark",
@@ -153,6 +194,8 @@ reasons = mart("fct_dead_letter_reasons")
 coherence = mart("fct_coherence")
 rec = mart("rec_stream_vs_batch")
 cal = mart("fct_calibration")
+flagged = mart("fct_flagged_recent")
+vol = mart("fct_volume_anomalies")
 
 valid = int(summary.iloc[0]["valid_count"]) if not summary.empty else 0
 dlq = int(summary.iloc[0]["dlq_count"]) if not summary.empty else 0
@@ -162,9 +205,18 @@ violations = 0
 if not coherence.empty and "is_incoherent" in coherence:
     violations = int(coherence["is_incoherent"].sum())
 
+# Reconciliation is scored over a recent window only. Lifetime counts get
+# polluted by orphaned old flags (stream flags whose valid counterpart was
+# pruned reconcile as phantom STREAM_ONLY), which understates live agreement.
+REC_WINDOW_HOURS = 48
+rec_recent = rec
+if not rec.empty and "minute" in rec:
+    mx = pd.to_datetime(rec["minute"]).max()
+    rec_recent = rec[pd.to_datetime(rec["minute"]) >= mx - pd.Timedelta(hours=REC_WINDOW_HOURS)]
+
 agreement = None
-if not rec.empty and "reconciliation_status" in rec:
-    counts = rec["reconciliation_status"].value_counts()
+if not rec_recent.empty and "reconciliation_status" in rec_recent:
+    counts = rec_recent["reconciliation_status"].value_counts()
     total = int(counts.sum())
     both = int(counts.get("BOTH", 0))
     if total:
@@ -179,7 +231,7 @@ st.markdown(
     <div class="masthead">
       <div class="eyebrow">Real-time market-integrity monitoring</div>
       <h1>Prediction-Market Surveillance
-        <span class="live-pill"><span class="live-dot"></span>LIVE</span>
+        {freshness_pill()}
       </h1>
       <p>A streaming pipeline that ingests a live Polymarket feed and watches it for two things:
       whether the data itself is trustworthy (contract validation, dead-lettering, stream-vs-batch
@@ -212,8 +264,8 @@ kpi(k3, "Coherence violations", f"{violations:,}",
     "outcomes not summing to ~1", tone="good" if violations == 0 else "bad")
 kpi(k4, "Stream-batch agreement",
     f"{agreement * 100:.1f}%" if agreement is not None else "—",
-    "records matched across paths",
-    tone="good" if (agreement or 0) >= 0.99 else "warn")
+    f"records matched across paths &middot; last {REC_WINDOW_HOURS}h",
+    tone="good" if (agreement or 0) >= 0.95 else "warn")
 
 
 # --------------------------------------------------------------------------- #
@@ -237,10 +289,11 @@ with left:
 
 with right:
     st.markdown('<div class="section-title">Stream vs batch reconciliation</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-note">Did the real-time path agree with the batch re-computation?</div>',
+    st.markdown(f'<div class="section-note">Did the real-time path agree with the batch re-computation? '
+                f'Last {REC_WINDOW_HOURS}h.</div>',
                 unsafe_allow_html=True)
-    if not rec.empty:
-        rc = rec["reconciliation_status"].value_counts().reset_index()
+    if not rec_recent.empty:
+        rc = rec_recent["reconciliation_status"].value_counts().reset_index()
         rc.columns = ["status", "n"]
         palette = {"BOTH": GREEN, "STREAM_ONLY": AMBER, "BATCH_ONLY": RED}
         fig = go.Figure(go.Bar(
@@ -288,6 +341,42 @@ else:
 
 
 # --------------------------------------------------------------------------- #
+# Surveillance: the actual detections (price-range flags + volume anomalies)
+# --------------------------------------------------------------------------- #
+st.markdown('<div class="section-title">Recent surveillance flags</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-note">The detections themselves, not just data health: real-time '
+    'price-range flags from the stream, and batch volume z-score outliers (a wash-trading footprint).</div>',
+    unsafe_allow_html=True,
+)
+
+fl, vo = st.columns(2)
+with fl:
+    st.markdown('<div class="section-note">Price-range flags &middot; most recent</div>', unsafe_allow_html=True)
+    if not flagged.empty:
+        show = flagged.sort_values("window_start", ascending=False).head(50)
+        cols = [c for c in ["window_start", "market_id", "price_range", "volume"] if c in show]
+        st.dataframe(
+            show[cols].style.format({"price_range": "{:.4f}", "volume": "{:,.0f}"}),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.caption("No recent price-range flags in the published window.")
+with vo:
+    st.markdown('<div class="section-note">Volume anomalies &middot; z-score outliers</div>', unsafe_allow_html=True)
+    if not vol.empty:
+        show = vol.sort_values("volume_z", ascending=False).head(50)
+        cols = [c for c in ["minute", "market_id", "volume", "volume_z"] if c in show]
+        st.dataframe(
+            show[cols].style.format({"volume": "{:,.0f}", "volume_z": "{:+.2f}"})
+                            .background_gradient(subset=["volume_z"], cmap="YlOrRd"),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.caption("No volume anomalies in the published window.")
+
+
+# --------------------------------------------------------------------------- #
 # Calibration
 # --------------------------------------------------------------------------- #
 st.markdown('<div class="section-title">Calibration vs real resolutions</div>', unsafe_allow_html=True)
@@ -308,7 +397,10 @@ if not cal.empty and "brier_score" in cal:
         use_container_width=True, hide_index=True,
     )
 else:
-    st.caption("No resolved markets scored yet - resolutions accumulate over days.")
+    st.caption(
+        "Awaiting first market resolution. Calibration populates only when a market this collector "
+        "tracked actually resolves, so the wait depends on those markets' end dates."
+    )
 
 
 # --------------------------------------------------------------------------- #
