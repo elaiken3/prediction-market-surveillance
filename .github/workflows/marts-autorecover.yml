@@ -1,0 +1,101 @@
+# Off-box AUTO-RECOVERY for the collector.
+#
+# marts-freshness.yml ALERTS when S3 goes stale. This workflow ACTS: if the
+# published marts are stale past REBOOT_AGE_MINUTES and the EC2 instance is
+# *running* (wedged, not deliberately stopped), it reboots the box. A reboot
+# re-runs DHCP and restores the default route, which is the recurring failure
+# (CLAUDE.md s9 "The box loses its network but stays powered"). It is keyed off
+# S3 freshness of the real artifact because that is the one signal that has
+# caught every outage; the box's own monitors die with it, and the EC2 instance
+# status check does not reliably trip for this wedge.
+#
+# Safe during deliberate cost-stops: a stopped instance is skipped (we only
+# reboot a running box), and reboot-instances would not start it anyway.
+#
+# SETUP (one-time): create repo secrets with creds for the box's account,
+# 551504153614 (NOT the default test account, see CLAUDE.md s9):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# for an IAM user with this least-privilege policy and nothing else:
+#   { "Version": "2012-10-17", "Statement": [
+#     { "Effect": "Allow", "Action": "ec2:RebootInstances",
+#       "Resource": "arn:aws:ec2:us-east-1:551504153614:instance/i-05de8e049933efea0" },
+#     { "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" } ] }
+# (DescribeInstances has no resource-level scoping, hence "*".) Optional
+# MARTS_ALERT_SLACK_WEBHOOK posts when a reboot happens.
+name: marts-autorecover
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min (scheduled runs can lag under load)
+  workflow_dispatch: {}        # manual run to test
+
+concurrency:
+  group: marts-autorecover
+  cancel-in-progress: false
+
+env:
+  MARTS_BASE_URL: "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts"
+  CANARY_MART: "fct_ingest_summary.parquet"
+  REBOOT_AGE_MINUTES: "45"            # 3 missed 15-min publish cycles = confidently wedged
+  INSTANCE_ID: "i-05de8e049933efea0"
+  AWS_DEFAULT_REGION: "us-east-1"
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reboot the collector if marts are stale and it is wedged
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          MARTS_ALERT_SLACK_WEBHOOK: ${{ secrets.MARTS_ALERT_SLACK_WEBHOOK }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "::error::AWS creds not set. Add AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY repo secrets for account 551504153614 (see header)."
+            exit 1
+          fi
+
+          url="${MARTS_BASE_URL}/${CANARY_MART}"
+          last_modified="$(curl -sSI "$url" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r')"
+          if [ -z "$last_modified" ]; then
+            echo "::warning::No Last-Modified from $url; not rebooting on an ambiguous signal."
+            exit 0
+          fi
+
+          age_sec=$(( $(date +%s) - $(date -d "$last_modified" +%s) ))
+          age_min=$(( age_sec / 60 ))
+          echo "marts age: ${age_min} min (reboot threshold ${REBOOT_AGE_MINUTES} min)"
+
+          if [ "$age_min" -le "$REBOOT_AGE_MINUTES" ]; then
+            echo "fresh enough; no action."
+            exit 0
+          fi
+
+          # Stale. Only reboot a RUNNING box -- leave a deliberate cost-stop alone.
+          state="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)"
+          echo "instance ${INSTANCE_ID} state: ${state}"
+          if [ "$state" != "running" ]; then
+            echo "::warning::marts stale ${age_min} min but instance is '${state}', not running -> not rebooting (likely a deliberate stop)."
+            exit 0
+          fi
+
+          echo "marts stale ${age_min} min and instance running -> rebooting ${INSTANCE_ID}"
+          aws ec2 reboot-instances --instance-ids "$INSTANCE_ID"
+
+          msg="marts-autorecover: rebooted ${INSTANCE_ID} (marts were ${age_min} min stale). A reboot restores the lost default route; box should publish again in ~5-10 min."
+          if [ -n "${MARTS_ALERT_SLACK_WEBHOOK:-}" ]; then
+            curl -fsS -X POST -H 'Content-Type: application/json' -d "{\"text\": \"${msg}\"}" "$MARTS_ALERT_SLACK_WEBHOOK" || true
+          fi
+          {
+            echo "### marts-autorecover"
+            echo "- Rebooted \`${INSTANCE_ID}\` (marts were **${age_min} min** stale)"
+            echo "- A reboot re-runs DHCP and restores the default route; expect a fresh publish in ~5-10 min."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Exit non-zero so GitHub emails the owner that an auto-reboot occurred.
+          # (Scheduled workflows only notify on failure; a "failed" run here means
+          # "intervention was required", which is exactly what we want surfaced.)
+          echo "::error::${msg}"
+          exit 1

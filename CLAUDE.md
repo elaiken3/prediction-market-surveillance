@@ -82,6 +82,7 @@ deploy/
   setup_autoreboot_alarm.sh          Creates a CloudWatch alarm to force-reboot the box on instance status-check fail
   profiles.yml                       dbt profile used on the VM
 .github/workflows/marts-freshness.yml  Off-box monitor: GitHub Actions cron curls S3 Last-Modified, fails the job if stale
+.github/workflows/marts-autorecover.yml  Off-box recovery: reboots the box (via aws) when S3 marts are stale and it is wedged
 .streamlit/config.toml               Dark finance theme for the dashboard
 tests/                               pytest: test_validate, test_normalize, test_detectors (24 tests)
 airflow/dags/surveillance_dag.py     Airflow DAG variant (not the primary deploy path)
@@ -152,6 +153,15 @@ target in the active path anymore.
   (default 60). Catches "whole box is down/stopped." Optional `MARTS_ALERT_SLACK_WEBHOOK` repo secret
   posts to Slack. Note: it cannot tell "stopped for cost" from "broken," so it will fire during
   deliberate stop windows — raise the threshold or disable the workflow for long stops.
+- **Off-box recovery:** `.github/workflows/marts-autorecover.yml` (every 30 min) goes a step further:
+  if marts are stale past `REBOOT_AGE_MINUTES` (default 45) AND the instance is *running* (wedged, not
+  a deliberate stop), it calls `aws ec2 reboot-instances` to clear the lost-default-route wedge (§9),
+  then exits non-zero so the reboot is emailed. This is symptom-driven (keys off S3 freshness, the only
+  signal that caught every outage) rather than trusting the instance status check, which does not
+  reliably trip for this failure. Needs repo secrets `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for a
+  least-privilege IAM user (`ec2:RebootInstances` on the one instance) in account 551504153614.
+  Preferred over the CloudWatch `setup_autoreboot_alarm.sh` for this failure mode; keep the alarm only
+  if the instance status check is confirmed to trip.
 
 **S3 (the serving store):**
 - Bucket: `pms-marts-elaiken3`, region **us-east-1** (same region as the VM)
