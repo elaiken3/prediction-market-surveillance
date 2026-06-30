@@ -20,9 +20,23 @@
 # cost-saving stop. A wedged-but-running box reports the failure as real data
 # (value 1), so genuine failures still trigger.
 #
-# Run from the Mac (has AWS creds). Idempotent: re-running updates the alarm.
+# Run from the Mac with creds for the box's account (551504153614), e.g.
+#   AWS_PROFILE=pms bash deploy/setup_autoreboot_alarm.sh
+# NOT the default profile, which may be a leftover test user in another account
+# (see CLAUDE.md s9 "aws from the Mac can silently target the wrong account"): an
+# alarm created in the wrong account targets a non-existent instance and never
+# fires. Verify first with: aws sts get-caller-identity  (Account == 551504153614).
+# Idempotent: re-running updates the alarm.
 set -euo pipefail
 export PATH="$PATH:/snap/bin"   # in case aws is a snap install
+
+# Fail fast if pointed at the wrong account, rather than creating a dead alarm.
+ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+if [ "$ACCOUNT" != "551504153614" ]; then
+  echo "ERROR: aws is account $ACCOUNT, expected 551504153614 (the box's account)." >&2
+  echo "       Use the right profile, e.g. AWS_PROFILE=pms $0" >&2
+  exit 1
+fi
 
 INSTANCE_ID="${INSTANCE_ID:-i-05de8e049933efea0}"   # pms-prod-2
 REGION="${REGION:-us-east-1}"
