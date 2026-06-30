@@ -123,6 +123,10 @@ target in the active path anymore.
 
 **EC2 collector (the "VM"):**
 - Instance: `pms-prod-2`, id `i-05de8e049933efea0`, Ubuntu 24.04 x86_64, t3.large, 40 GB gp3
+- AWS account: **551504153614**. NOT the same account as a stray local `aws` default profile
+  (`astro-iceberg-test-user` in `160885272715`). Any `aws` command for this box must use creds for
+  551504153614 (set up a named profile, e.g. `aws --profile pms ...`); the default profile silently
+  hits the wrong account and returns `InvalidInstanceID.NotFound`. Confirm with `aws sts get-caller-identity`.
 - Region: **us-east-1** (AZ us-east-1d). Confirm from the box via IMDS:
   `TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60"); curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region`
 - Public IPv4 **changes on stop/start** (no Elastic IP). Prefer the stable Tailscale IP.
@@ -306,6 +310,15 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   `301 Moved Permanently`. Confirm with `aws s3api get-bucket-location --bucket pms-marts-elaiken3`
   (null = us-east-1). (An earlier version of this file claimed the VM was in us-east-2; IMDS says
   us-east-1. Trust IMDS / the SSM endpoint in the logs over the doc.)
+- **`aws` from the Mac can silently target the wrong account.** The local default profile is a leftover
+  `astro-iceberg-test-user` in account `160885272715`; the box and bucket live in `551504153614`. So
+  `aws ec2 describe-instances --instance-ids i-05de8e049933efea0` returned `InvalidInstanceID.NotFound`
+  and a Name-tag search found nothing, which looked like "the instance was terminated" when really we
+  were just looking in the wrong account. Worse, the auto-reboot alarm got created in the wrong account
+  against a non-existent instance and sat in `OK` (because `treat-missing-data notBreaching` reads a
+  missing metric as fine), so it was pure theater and never could have fired. Always
+  `aws sts get-caller-identity` first; manage the box with a profile scoped to `551504153614`. Lesson:
+  `NotFound` plus an "OK" alarm with no datapoints is the signature of wrong-account, not a dead box.
 - **EC2 public IP changes on stop/start.** Use the Tailscale IP (`100.76.72.41`) for stable
   access, or pull the current Public IPv4 from the console each time.
 - **Streamlit can't change the main file path** on an existing app, you must delete and
