@@ -23,6 +23,8 @@ MARTS = [
     "fct_coherence",
     "rec_stream_vs_batch",
     "fct_calibration",
+    "fct_flagged_recent",
+    "fct_volume_anomalies",
 ]
 
 
