@@ -337,6 +337,16 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - **Zero reject rate is ambiguous.** A clean dead-letter path can mean the contract is healthy
   OR that it has quietly stopped firing. Keep dead-letter reasons visible; periodically feed a
   known-bad event to confirm the path still fires.
+- **A "healthy" container can be silently dead.** The lake stopped growing for 4 days while
+  `docker compose ps` showed `ingestion` / `spark-stream` / `redpanda` all `Up` (redpanda even
+  `healthy`). The WS dropped once (keepalive 1011 during a reboot), logged `reconnecting in 1s`, then
+  reconnected at the socket level but received zero market data and `async for raw in ws` blocked
+  forever. "Up" means the process is alive, not that data moves. Diagnosis: newest `data/lake/valid/`
+  partition is the tell (`ls .../valid | tail`), and `docker compose logs --timestamps ingestion` shows
+  the last line's age. Fixed with a liveness watchdog (`asyncio.wait_for` on `recv`, `--idle-timeout`)
+  that forces a reconnect on no-data, plus re-discovering token ids each reconnect (closed markets go
+  quiet). Lesson: for a collector, "is fresh data landing?" is the only real health check -- the mart
+  freshness monitors catch the symptom, but check the lake partition dates to find the stall.
 
 ---
 
