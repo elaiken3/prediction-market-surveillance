@@ -78,8 +78,12 @@ def tracked_market_ids(lake: str) -> set[str]:
         import duckdb
 
         con = duckdb.connect()
+        # Glob only the real date partitions. The top-level _seed_empty.parquet
+        # placeholder has an all-NULL market_id column whose type collides with
+        # the real VARCHAR partitions (Unimplemented cast VARCHAR -> NULL), which
+        # otherwise throws and drops us into the keep-all fallback.
         rows = con.execute(
-            f"select distinct market_id from read_parquet('{lake}/valid/**/*.parquet') "
+            f"select distinct market_id from read_parquet('{lake}/valid/event_date=*/*.parquet') "
             "where market_id is not null"
         ).fetchall()
         return {r[0] for r in rows}

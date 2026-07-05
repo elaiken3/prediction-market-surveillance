@@ -62,7 +62,7 @@ services:
       - -c
       - >
         if [ "$$INGEST_MODE" = "live" ]; then
-          python -m ingestion.polymarket_ws --bootstrap redpanda:29092 --topic markets.events --markets 8;
+          python -m ingestion.polymarket_ws --bootstrap redpanda:29092 --topic markets.events --markets 8 --resolve-soon 2;
         else
           python -m ingestion.synthetic --bootstrap redpanda:29092 --topic markets.events --count 0 --rate 20 --manip-rate 0.05 --dirty-rate 0.05;
         fi
