@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import time
 
 import requests
 import websockets
@@ -53,19 +52,31 @@ def _make_producer(bootstrap: str):
 
 
 async def run(args) -> None:
-    token_ids = discover_token_ids(args.markets)
-    if not token_ids:
-        raise SystemExit("no token ids discovered from Gamma; check connectivity/params")
-    print(f"subscribing to {len(token_ids)} outcome tokens")
     producer = None if args.dry_run else _make_producer(args.bootstrap)
 
     backoff = 1.0
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, max_size=2**22) as ws:
+            # Re-discover token ids on every (re)connect. Markets close and go
+            # quiet, so reusing the startup set can reconnect to channels that
+            # emit nothing; a fresh set keeps us on active markets.
+            token_ids = discover_token_ids(args.markets)
+            if not token_ids:
+                raise RuntimeError("no active token ids discovered from Gamma")
+            print(f"subscribing to {len(token_ids)} outcome tokens")
+
+            async with websockets.connect(
+                WS_URL, ping_interval=20, ping_timeout=20, max_size=2**22
+            ) as ws:
                 await ws.send(json.dumps({"type": "market", "assets_ids": token_ids}))
                 backoff = 1.0  # reset on a clean connect
-                async for raw in ws:
+                while True:
+                    # Liveness watchdog: the socket can stay open (pings answered)
+                    # while the server streams zero market data. Without a timeout
+                    # the receive blocks forever -- the silent 4-day stall that
+                    # froze the lake while every container still showed "Up". A
+                    # timeout forces a fresh reconnect + resubscribe instead.
+                    raw = await asyncio.wait_for(ws.recv(), timeout=args.idle_timeout)
                     try:
                         payload = json.loads(raw)
                     except json.JSONDecodeError:
@@ -82,9 +93,11 @@ async def run(args) -> None:
                                 print(json.dumps(ev))
                             else:
                                 producer.send(args.topic, key=ev.get("asset_id"), value=ev)
-        except (websockets.ConnectionClosed, OSError) as exc:
+        except asyncio.TimeoutError:
+            print(f"no market data for {args.idle_timeout}s; forcing reconnect")
+        except (websockets.ConnectionClosed, OSError, requests.RequestException, RuntimeError) as exc:
             print(f"ws disconnected ({exc}); reconnecting in {backoff:.0f}s")
-            time.sleep(backoff)
+            await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)  # exponential backoff, capped
         finally:
             if producer is not None:
@@ -105,6 +118,8 @@ def main() -> None:
     ap.add_argument("--topic", default="markets.events")
     ap.add_argument("--dlq-topic", default="markets.dlq")
     ap.add_argument("--markets", type=int, default=8, help="number of active markets to subscribe to")
+    ap.add_argument("--idle-timeout", type=float, default=120.0,
+                    help="seconds of zero market data before forcing a reconnect (liveness watchdog)")
     ap.add_argument("--dry-run", action="store_true", help="print events instead of producing")
     args = ap.parse_args()
     asyncio.run(run(args))
