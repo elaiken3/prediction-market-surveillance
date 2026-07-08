@@ -1,27 +1,33 @@
 # Off-box AUTO-RECOVERY for the collector.
 #
 # marts-freshness.yml ALERTS when S3 goes stale. This workflow ACTS: if the
-# published marts are stale past REBOOT_AGE_MINUTES and the EC2 instance is
-# *running* (wedged, not deliberately stopped), it reboots the box. A reboot
-# re-runs DHCP and restores the default route, which is the recurring failure
-# (CLAUDE.md s9 "The box loses its network but stays powered"). It is keyed off
-# S3 freshness of the real artifact because that is the one signal that has
-# caught every outage; the box's own monitors die with it, and the EC2 instance
-# status check does not reliably trip for this wedge.
+# published marts are stale past STALE_MINUTES and the EC2 instance is *running*
+# (wedged, not a deliberate stop), it STOP/STARTS the box. It does NOT reboot:
+# the recurring failure is a lost network route (CLAUDE.md s9), and reboots do
+# NOT clear it -- only a stop/start (which moves the instance to fresh hardware
+# and re-runs DHCP) does. It keys off S3 freshness of the real artifact because
+# that is the one signal that has caught every outage.
+#
+# Anti-loop cooldown: a stop/start resets the instance LaunchTime, so we only
+# act when the box has been running (since its last start) for at least
+# COOLDOWN_MINUTES. After a recovery the box gets that long to boot and publish
+# before another attempt, which is what stops the reboot-loop that spammed us
+# and power-cycled the box every cycle.
 #
 # Safe during deliberate cost-stops: a stopped instance is skipped (we only
-# reboot a running box), and reboot-instances would not start it anyway.
+# recover a running box; we never start a box someone stopped on purpose).
 #
-# SETUP (one-time): create repo secrets with creds for the box's account,
-# 551504153614 (NOT the default test account, see CLAUDE.md s9):
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-# for an IAM user with this least-privilege policy and nothing else:
+# SETUP (one-time): repo secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for
+# an IAM user in the box's account (551504153614) with ONLY:
 #   { "Version": "2012-10-17", "Statement": [
-#     { "Effect": "Allow", "Action": "ec2:RebootInstances",
+#     { "Effect": "Allow",
+#       "Action": ["ec2:StopInstances", "ec2:StartInstances"],
 #       "Resource": "arn:aws:ec2:us-east-1:551504153614:instance/i-05de8e049933efea0" },
 #     { "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" } ] }
 # (DescribeInstances has no resource-level scoping, hence "*".) Optional
-# MARTS_ALERT_SLACK_WEBHOOK posts when a reboot happens.
+# MARTS_ALERT_SLACK_WEBHOOK posts when a recovery happens. A manually-disabled
+# workflow stays disabled across pushes -- re-enable it in the Actions UI once
+# the IAM policy is updated.
 name: marts-autorecover
 
 on:
@@ -36,7 +42,8 @@ concurrency:
 env:
   MARTS_BASE_URL: "https://pms-marts-elaiken3.s3.us-east-1.amazonaws.com/marts"
   CANARY_MART: "fct_ingest_summary.parquet"
-  REBOOT_AGE_MINUTES: "45"            # 3 missed 15-min publish cycles = confidently wedged
+  STALE_MINUTES: "45"          # 3 missed 15-min publish cycles = confidently wedged
+  COOLDOWN_MINUTES: "45"       # min uptime since last start before acting again (anti-loop)
   INSTANCE_ID: "i-05de8e049933efea0"
   AWS_DEFAULT_REGION: "us-east-1"
 
@@ -44,7 +51,7 @@ jobs:
   recover:
     runs-on: ubuntu-latest
     steps:
-      - name: Reboot the collector if marts are stale and it is wedged
+      - name: Stop/start the collector if marts are stale and it is wedged
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -59,43 +66,49 @@ jobs:
           url="${MARTS_BASE_URL}/${CANARY_MART}"
           last_modified="$(curl -sSI "$url" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r')"
           if [ -z "$last_modified" ]; then
-            echo "::warning::No Last-Modified from $url; not rebooting on an ambiguous signal."
+            echo "::warning::No Last-Modified from $url; not acting on an ambiguous signal."
             exit 0
           fi
-
-          age_sec=$(( $(date +%s) - $(date -d "$last_modified" +%s) ))
-          age_min=$(( age_sec / 60 ))
-          echo "marts age: ${age_min} min (reboot threshold ${REBOOT_AGE_MINUTES} min)"
-
-          if [ "$age_min" -le "$REBOOT_AGE_MINUTES" ]; then
+          age_min=$(( ( $(date +%s) - $(date -d "$last_modified" +%s) ) / 60 ))
+          echo "marts age: ${age_min} min (stale threshold ${STALE_MINUTES} min)"
+          if [ "$age_min" -le "$STALE_MINUTES" ]; then
             echo "fresh enough; no action."
             exit 0
           fi
 
-          # Stale. Only reboot a RUNNING box -- leave a deliberate cost-stop alone.
-          state="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)"
-          echo "instance ${INSTANCE_ID} state: ${state}"
+          # Instance state + how long it has run since its last start.
+          read -r state launch < <(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].[State.Name,LaunchTime]' --output text)
+          echo "instance ${INSTANCE_ID}: state=${state} launched=${launch}"
+
           if [ "$state" != "running" ]; then
-            echo "::warning::marts stale ${age_min} min but instance is '${state}', not running -> not rebooting (likely a deliberate stop)."
+            echo "::warning::marts stale ${age_min} min but instance is '${state}', not running -> skip (deliberate stop)."
             exit 0
           fi
 
-          echo "marts stale ${age_min} min and instance running -> rebooting ${INSTANCE_ID}"
-          aws ec2 reboot-instances --instance-ids "$INSTANCE_ID"
+          up_min=$(( ( $(date +%s) - $(date -d "$launch" +%s) ) / 60 ))
+          if [ "$up_min" -lt "$COOLDOWN_MINUTES" ]; then
+            echo "::warning::marts stale ${age_min} min but instance started only ${up_min} min ago (< ${COOLDOWN_MINUTES}m cooldown) -> giving it time to recover, no action."
+            exit 0
+          fi
 
-          msg="marts-autorecover: rebooted ${INSTANCE_ID} (marts were ${age_min} min stale). A reboot restores the lost default route; box should publish again in ~5-10 min."
+          # Stale + running + past cooldown -> the wedge only a stop/start clears.
+          echo "stop/starting ${INSTANCE_ID} (marts ${age_min} min stale, up ${up_min} min)"
+          aws ec2 stop-instances  --instance-ids "$INSTANCE_ID" >/dev/null
+          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          msg="marts-autorecover: stop/started ${INSTANCE_ID} (marts were ${age_min} min stale, box up ${up_min} min). A stop/start moves to fresh hardware and clears the network wedge; publishing should resume in ~10-15 min."
           if [ -n "${MARTS_ALERT_SLACK_WEBHOOK:-}" ]; then
             curl -fsS -X POST -H 'Content-Type: application/json' -d "{\"text\": \"${msg}\"}" "$MARTS_ALERT_SLACK_WEBHOOK" || true
           fi
           {
             echo "### marts-autorecover"
-            echo "- Rebooted \`${INSTANCE_ID}\` (marts were **${age_min} min** stale)"
-            echo "- A reboot re-runs DHCP and restores the default route; expect a fresh publish in ~5-10 min."
+            echo "- Stop/started \`${INSTANCE_ID}\` (marts were **${age_min} min** stale, up ${up_min} min)"
+            echo "- Stop/start (not reboot) clears the lost-route wedge; expect a fresh publish in ~10-15 min."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Exit non-zero so GitHub emails the owner that an auto-reboot occurred.
-          # (Scheduled workflows only notify on failure; a "failed" run here means
-          # "intervention was required", which is exactly what we want surfaced.)
+          # Exit non-zero so GitHub emails the owner that a recovery occurred.
           echo "::error::${msg}"
           exit 1

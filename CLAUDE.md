@@ -154,14 +154,17 @@ target in the active path anymore.
   posts to Slack. Note: it cannot tell "stopped for cost" from "broken," so it will fire during
   deliberate stop windows — raise the threshold or disable the workflow for long stops.
 - **Off-box recovery:** `.github/workflows/marts-autorecover.yml` (every 30 min) goes a step further:
-  if marts are stale past `REBOOT_AGE_MINUTES` (default 45) AND the instance is *running* (wedged, not
-  a deliberate stop), it calls `aws ec2 reboot-instances` to clear the lost-default-route wedge (§9),
-  then exits non-zero so the reboot is emailed. This is symptom-driven (keys off S3 freshness, the only
-  signal that caught every outage) rather than trusting the instance status check, which does not
-  reliably trip for this failure. Needs repo secrets `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for a
-  least-privilege IAM user (`ec2:RebootInstances` on the one instance) in account 551504153614.
-  Preferred over the CloudWatch `setup_autoreboot_alarm.sh` for this failure mode; keep the alarm only
-  if the instance status check is confirmed to trip.
+  if marts are stale past `STALE_MINUTES` (default 45) AND the instance is *running* (wedged, not a
+  deliberate stop) AND it has been up at least `COOLDOWN_MINUTES` (default 45), it **stop/starts** the
+  box (not reboot -- a reboot does NOT clear the lost-route wedge; only a stop/start, which moves to
+  fresh hardware, does; proven the hard way, see §9), then exits non-zero so the recovery is emailed.
+  The cooldown keys off the instance `LaunchTime` (a stop/start resets it), so after a recovery the box
+  gets time to boot and publish before another attempt -- this is what prevents the reboot-loop that
+  once power-cycled the box every cycle and spammed the owner. Needs repo secrets
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for a least-privilege IAM user in account 551504153614
+  with `ec2:StopInstances`/`ec2:StartInstances` on the one instance + `ec2:DescribeInstances`. A
+  manually-disabled workflow stays disabled across pushes -- re-enable in the Actions UI after updating
+  the IAM policy. (Supersedes the earlier `ec2:reboot` version and the CloudWatch alarm.)
 
 **S3 (the serving store):**
 - Bucket: `pms-marts-elaiken3`, region **us-east-1** (same region as the VM)
