@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import datetime
 import email.utils
+import html
 import os
+import re
+import urllib.error
 import urllib.request
 
 import duckdb
@@ -91,6 +94,18 @@ st.markdown(
         color: {MUTED}; font-size: 0.8rem; line-height: 1.6;
       }}
       .foot a {{ color: {BLUE}; text-decoration: none; }}
+
+      .outage {{
+        background: {PANEL}; border: 1px solid {BORDER}; border-left: 3px solid {RED};
+        border-radius: 10px; padding: 1.2rem 1.4rem;
+      }}
+      .outage .label {{
+        font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem; letter-spacing: 0.12em;
+        text-transform: uppercase; color: {RED}; margin-bottom: 0.5rem;
+      }}
+      .outage h2 {{ font-size: 1.15rem; font-weight: 600; color: {TEXT}; margin: 0 0 0.5rem 0; padding: 0; }}
+      .outage p {{ color: {MUTED}; font-size: 0.92rem; line-height: 1.55; max-width: 760px; margin: 0 0 0.4rem 0; }}
+      .outage code {{ font-family: 'IBM Plex Mono', monospace; color: {TEXT}; background: transparent; padding: 0; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -110,53 +125,65 @@ def _secret(name: str, default: str | None = None) -> str | None:
 
 
 BASE = (_secret("marts_base_url") or "").rstrip("/")
+if not BASE:
+    st.error("No marts_base_url set. Add it in Streamlit secrets.")
+    st.stop()
 
 
 @st.cache_resource
 def connect():
-    if not BASE:
-        st.error("No marts_base_url set. Add it in Streamlit secrets.")
-        st.stop()
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     return con
 
 
-con = connect()
-
-
 @st.cache_data(ttl=60)
 def mart(name: str) -> pd.DataFrame:
     try:
-        return con.execute(f"SELECT * FROM read_parquet('{BASE}/{name}.parquet')").fetch_df()
+        return connect().execute(f"SELECT * FROM read_parquet('{BASE}/{name}.parquet')").fetch_df()
     except Exception:  # noqa: BLE001
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=60)
-def marts_age_minutes() -> float | None:
-    """Age of the published marts, from the S3 object's Last-Modified header.
+def source_status() -> dict:
+    """Probe the canary mart: is the source reachable, and how old is it?
 
-    This is the one honest freshness signal: a green build that never reaches S3
-    leaves this old (the failure that froze this dashboard for days). The badge
-    turns red so silent staleness can never look LIVE again.
+    "The marts are empty" and "the marts cannot be read at all" look identical if
+    every failure is swallowed into an empty frame, and the second must never be
+    drawn as zeros and green tiles. (It was: with S3 refusing every request the
+    page showed "0.0% reject rate" and "Markets are summing cleanly".) So
+    reachability is reported explicitly and the page shows an outage panel
+    instead of data when this fails.
+
+    Age comes from the object's Last-Modified header. A green build that never
+    reaches S3 leaves it old, the failure that once froze this dashboard for
+    days, so the pill turns red rather than letting stale data look LIVE.
     """
     try:
-        req = urllib.request.Request(f"{BASE}/fct_ingest_summary.parquet", method="HEAD")
-        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310
+        with urllib.request.urlopen(f"{BASE}/fct_ingest_summary.parquet", timeout=10) as r:
             lm = r.headers.get("Last-Modified")
-        if not lm:
-            return None
-        dt = email.utils.parsedate_to_datetime(lm)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return (now - dt).total_seconds() / 60.0
-    except Exception:  # noqa: BLE001
-        return None
+        age = None
+        if lm:
+            dt = email.utils.parsedate_to_datetime(lm)
+            age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds() / 60.0
+        return {"ok": True, "age": age, "detail": ""}
+    except urllib.error.HTTPError as e:
+        # S3 puts the real reason in a small XML body, and the codes mean very
+        # different things: AllAccessDisabled (the owning AWS account is
+        # suspended or closed), AccessDenied (policy, or a key that is not there),
+        # NoSuchBucket. A GET is used because a HEAD error carries no body.
+        m = re.search(r"<Code>([^<]+)</Code>", e.read(2048).decode("utf-8", "replace"))
+        return {"ok": False, "age": None, "detail": f"HTTP {e.code}" + (f" {m.group(1)}" if m else "")}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "age": None, "detail": type(e).__name__}
 
 
-def freshness_pill() -> str:
-    age = marts_age_minutes()
-    if age is None:
+def freshness_pill(available: bool) -> str:
+    age = source_status()["age"]
+    if not available:
+        color, label = RED, "DATA UNAVAILABLE"
+    elif age is None:
         color, label = MUTED, "DATA AGE UNKNOWN"
     elif age <= 30:
         color, label = GREEN, f"LIVE &middot; {int(age)}m ago"
@@ -186,10 +213,88 @@ def plotly_shell(fig: go.Figure, height: int = 300) -> go.Figure:
     return fig
 
 
+def render_footer() -> None:
+    st.markdown(
+        """
+        <div class="foot">
+          Polymarket WebSocket -> Redpanda -> PySpark Structured Streaming -> Parquet lake -> dbt marts -> S3.
+          &nbsp;&middot;&nbsp; Source: <a href="https://github.com/elaiken3/prediction-market-surveillance" target="_blank">github.com/elaiken3/prediction-market-surveillance</a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def outage(reason_html: str) -> None:
+    """Say plainly that the source cannot be read, then stop.
+
+    Nothing below this may render: every tile and panel would otherwise fall back
+    to an empty frame and read as a healthy, quiet market.
+    """
+    st.markdown(
+        f"""
+        <div class="outage">
+          <div class="label">Data source unavailable</div>
+          <h2>The published marts cannot be read right now.</h2>
+          <p>{reason_html}, so there is nothing trustworthy to show. This is an outage of the
+          data source, not a quiet market: the figures are unknown, not zero.</p>
+          <p>The page recovers on its own once the marts are readable again.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_footer()
+    st.stop()
+
+
 # --------------------------------------------------------------------------- #
-# Load marts
+# Source check, before the page claims anything. DuckDB is only touched (for the
+# single-row summary mart) once the storage has answered the probe.
 # --------------------------------------------------------------------------- #
-summary = mart("fct_ingest_summary")
+SOURCE = source_status()
+summary = pd.DataFrame()
+outage_reason = None
+if not SOURCE["ok"]:
+    outage_reason = (
+        f"The storage behind this dashboard returned <code>{html.escape(SOURCE['detail'])}</code>"
+    )
+else:
+    # fct_ingest_summary is a single-row aggregate, so an empty frame is a failed
+    # read (the storage answered but the query engine could not load the mart),
+    # never "no data". Falling back to zeros would repeat the same lie.
+    summary = mart("fct_ingest_summary")
+    if summary.empty:
+        outage_reason = "The storage answered, but the summary mart could not be loaded"
+
+
+# --------------------------------------------------------------------------- #
+# Masthead
+# --------------------------------------------------------------------------- #
+st.markdown(
+    f"""
+    <div class="masthead">
+      <div class="eyebrow">Real-time market-integrity monitoring</div>
+      <h1>Prediction-Market Surveillance
+        {freshness_pill(available=outage_reason is None)}
+      </h1>
+      <p>A streaming pipeline that ingests a live Polymarket feed and watches it for two things:
+      whether the data itself is trustworthy (contract validation, dead-lettering, stream-vs-batch
+      reconciliation) and whether the market is behaving coherently (outcome probabilities that
+      fail to sum to one, a classic manipulation and mispricing signal). Raw events stay on the
+      collector; only aggregated marts are published here, refreshed every 15 minutes.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+if outage_reason:
+    outage(outage_reason)
+
+
+# --------------------------------------------------------------------------- #
+# Load the remaining marts
+# --------------------------------------------------------------------------- #
 reasons = mart("fct_dead_letter_reasons")
 coherence = mart("fct_coherence")
 rec = mart("rec_stream_vs_batch")
@@ -197,9 +302,9 @@ cal = mart("fct_calibration")
 flagged = mart("fct_flagged_recent")
 vol = mart("fct_volume_anomalies")
 
-valid = int(summary.iloc[0]["valid_count"]) if not summary.empty else 0
-dlq = int(summary.iloc[0]["dlq_count"]) if not summary.empty else 0
-reject_rate = float(summary.iloc[0]["reject_rate"]) if not summary.empty else 0.0
+valid = int(summary.iloc[0]["valid_count"])
+dlq = int(summary.iloc[0]["dlq_count"])
+reject_rate = float(summary.iloc[0]["reject_rate"])
 
 violations = 0
 if not coherence.empty and "is_incoherent" in coherence:
@@ -221,27 +326,6 @@ if not rec_recent.empty and "reconciliation_status" in rec_recent:
     both = int(counts.get("BOTH", 0))
     if total:
         agreement = both / total
-
-
-# --------------------------------------------------------------------------- #
-# Masthead
-# --------------------------------------------------------------------------- #
-st.markdown(
-    f"""
-    <div class="masthead">
-      <div class="eyebrow">Real-time market-integrity monitoring</div>
-      <h1>Prediction-Market Surveillance
-        {freshness_pill()}
-      </h1>
-      <p>A streaming pipeline that ingests a live Polymarket feed and watches it for two things:
-      whether the data itself is trustworthy (contract validation, dead-lettering, stream-vs-batch
-      reconciliation) and whether the market is behaving coherently (outcome probabilities that
-      fail to sum to one, a classic manipulation and mispricing signal). Raw events stay on the
-      collector; only aggregated marts are published here, refreshed every 15 minutes.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -406,12 +490,4 @@ else:
 # --------------------------------------------------------------------------- #
 # Footer
 # --------------------------------------------------------------------------- #
-st.markdown(
-    """
-    <div class="foot">
-      Polymarket WebSocket -> Redpanda -> PySpark Structured Streaming -> Parquet lake -> dbt marts -> S3.
-      &nbsp;&middot;&nbsp; Source: <a href="https://github.com/elaiken3/prediction-market-surveillance" target="_blank">github.com/elaiken3/prediction-market-surveillance</a>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+render_footer()
