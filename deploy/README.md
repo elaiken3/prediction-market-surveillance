@@ -80,21 +80,23 @@ the workflow for those windows.
 
 ## Auto-recovery (the box loses its network but stays powered)
 
-This collector has twice lost its default route while still running (interface up,
-but no route out: SSH dead, instance status check red, publish frozen, journal
-still logging). It is not a resource issue, so the fix is automated recovery:
-`setup_autoreboot_alarm.sh` creates a CloudWatch alarm that force-reboots the box
-on `StatusCheckFailed_Instance` (a reboot re-runs DHCP and restores the route).
+This collector has repeatedly lost its default route while still running (interface
+up, but no route out: SSH dead, instance status check red, publish frozen, journal
+still logging). It is not a resource issue, and a reboot does not clear it: only a
+stop/start, which moves the instance to fresh hardware, does.
 
-```bash
-# run from the Mac (admin creds), NOT the VM (its role is S3-only):
-bash deploy/setup_autoreboot_alarm.sh        # defaults: pms-prod-2, us-east-1
-```
+`.github/workflows/marts-autorecover.yml` automates that off-box. Every 30 minutes
+it checks the S3 `Last-Modified`; if the marts are stale past `STALE_MINUTES` while
+the instance is running, and the instance has been up at least `COOLDOWN_MINUTES`,
+it stop/starts the box and fails the run so the recovery is emailed. The cooldown
+(read from the instance `LaunchTime`) is what keeps it from looping, and a stopped
+instance is left alone so it never fights a deliberate stop. It needs repo secrets
+for an IAM user limited to `ec2:StopInstances`/`ec2:StartInstances` on the one
+instance plus `ec2:DescribeInstances`; the exact policy is in the workflow header.
 
-The action is `ec2:reboot`, not `ec2:recover`: AWS's recover action only fires on
-*system* status-check failures, and these are *instance* check failures. The
-off-box freshness monitor still emails you when it happens, so a silent auto-bounce
-is still visible.
+`setup_autoreboot_alarm.sh` (a CloudWatch alarm that reboots on
+`StatusCheckFailed_Instance`) is the earlier attempt and is superseded: reboots did
+not restore the route, and a reboot-based recovery looped for a day.
 
 ## Going further
 

@@ -79,10 +79,10 @@ deploy/
   check_marts_fresh.sh               Freshness probe: non-zero exit if newest S3 mart older than threshold
   marts-freshness.service / .timer   systemd: runs check_marts_fresh.sh every 15 min (on-box staleness alarm)
   lake-prune.service / .timer        systemd: daily prune of lake partitions older than 5 days (disk-full guard)
-  setup_autoreboot_alarm.sh          Creates a CloudWatch alarm to force-reboot the box on instance status-check fail
+  setup_autoreboot_alarm.sh          SUPERSEDED CloudWatch reboot alarm (reboots do not clear the network wedge; see marts-autorecover)
   profiles.yml                       dbt profile used on the VM
 .github/workflows/marts-freshness.yml  Off-box monitor: GitHub Actions cron curls S3 Last-Modified, fails the job if stale
-.github/workflows/marts-autorecover.yml  Off-box recovery: reboots the box (via aws) when S3 marts are stale and it is wedged
+.github/workflows/marts-autorecover.yml  Off-box recovery: stop/starts the box (via aws) when S3 marts are stale and it is wedged
 .streamlit/config.toml               Dark finance theme for the dashboard
 tests/                               pytest: test_validate, test_normalize, test_detectors (24 tests)
 airflow/dags/surveillance_dag.py     Airflow DAG variant (not the primary deploy path)
@@ -312,9 +312,11 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   exiting 253: **the host lost its default route while the ENI stayed attached.** ENETUNREACH is a
   routing verdict, not a throttle, so it is NOT a t3 CPU/network-credit problem (credits cause timeouts,
   never "no route") and changing instance type would not fix it. There is no resource cause to fix, so
-  the durable answer is automated recovery: `deploy/setup_autoreboot_alarm.sh` sets a CloudWatch alarm
-  that force-reboots on `StatusCheckFailed_Instance` (reboot re-runs DHCP and restores the route; AWS's
-  `ec2:recover` action does NOT apply to *instance* check failures, only *system* ones). To pin an
+  the durable answer is automated recovery. Reboots turned out NOT to clear it (a reboot-based
+  recovery looped for a day while the box stayed wedged, emailing each time); only a stop/start, which
+  moves the instance to fresh hardware, does. So `marts-autorecover.yml` stop/starts with a cooldown
+  (§6), and the earlier CloudWatch reboot alarm is superseded. (AWS's `ec2:recover` action does not
+  apply to *instance* check failures, only *system* ones.) The underlying cause is still open. To pin an
   AWS-side ENI/VPC blip vs. a local cause, check the instance Status-checks history and the AWS Health
   Dashboard for the failure window. Lesson: when a box is "down" but its disk/journal survive, read the
   prior boot's logs and trust the ENETUNREACH signature over the noisiest logger (tailscale).
@@ -350,6 +352,21 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   that forces a reconnect on no-data, plus re-discovering token ids each reconnect (closed markets go
   quiet). Lesson: for a collector, "is fresh data landing?" is the only real health check -- the mart
   freshness monitors catch the symptom, but check the lake partition dates to find the stall.
+- **`AllAccessDisabled` from S3 is the AWS account, not the bucket.** In November every request to
+  the marts bucket returned `403 AllAccessDisabled` ("All access to this object has been disabled"),
+  including the bucket root and keys that do not exist. That is the tell: a policy problem answers
+  `AccessDenied` and a missing object `NoSuchKey`, but this code comes back for everything because the
+  account that owns the bucket is suspended or closed (rarely, AWS has disabled the resource itself).
+  Nothing in this repo can fix it, and the collector lives in the same account, so it is down too. The
+  fix is in the AWS console as the root user of the account in §6 (check Billing first). One-line
+  probe: `curl -s <mart url> | grep -o '<Code>[^<]*'`. Two things let it go unnoticed. Both GitHub
+  monitors had been left `disabled_manually` since the July reboot-loop, so nothing alerted; and the
+  dashboard swallowed the 403 into empty frames and drew green zeros ("0.0% reject rate", "Markets are
+  summing cleanly"), so the page looked like a quiet market instead of an outage. The dashboard now
+  shows an outage panel with the storage's error code (§11). Also: AWS sends suspension and billing
+  notices only to the account's root email, so that must be a mailbox someone reads. Lessons: a
+  disabled alarm is no alarm, so re-enable monitors as soon as the incident that silenced them is over;
+  and an unreadable source must be shown as unknown, never as zero.
 
 ---
 
@@ -371,10 +388,17 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - [ ] Cost hygiene: stop the EC2 instance when not actively collecting (only EBS ~$3-4/mo when stopped).
       Remember the off-box freshness monitor will fire while it is stopped; raise `MAX_AGE_MINUTES` or
       disable the workflow for long stop windows.
-- [ ] Apply the auto-reboot alarm (`deploy/setup_autoreboot_alarm.sh`) for the recurring "lost network
-      but powered" failure (§9). Run it from the Mac (the VM's `pms-s3-writer` role has no CloudWatch
-      perms) and in `us-east-1` (the alarm must match the instance region). If reboots do not clear it,
-      open an AWS support/Health case for an ENI/VPC-side cause.
+- [ ] **Restore the AWS account** (§9 `AllAccessDisabled`). As of 2026-11-16 the whole deployment
+      (bucket and collector) is offline until the account in §6 is reinstated or the stack is rebuilt
+      elsewhere. Once S3 answers again: start the instance, confirm the S3 `Last-Modified` ticks, then
+      re-enable `marts-freshness`. Nothing irreplaceable lives there: marts are rebuilt every 15 min
+      and the lake keeps only 5 days, so a rebuild is a bucket with the public-read policy, a fresh
+      box with the `pms-s3-writer` role, and `bootstrap.sh`.
+- [ ] Both GitHub workflows have been `disabled_manually` since 2026-07-07. Re-enable
+      `marts-freshness` once the pipeline publishes again. Before re-enabling `marts-autorecover`,
+      widen its IAM user to `ec2:StopInstances`/`ec2:StartInstances` (§6).
+- [ ] Root cause of the recurring "lost network but powered" wedge (§9) is still open. Next steps:
+      a fresh instance in a different AZ with an Elastic IP, and an AWS support case if it recurs.
 
 **Resolved this session (was: dashboard serving stale data):** wired the S3 sync into `dbt-batch`
 (`ExecStartPost`), fixed `aws`-not-on-systemd-PATH, removed the `--acl` flag, made `fetch_resolutions`
@@ -405,3 +429,8 @@ The dashboard masthead shows a **freshness pill** driven by the S3 `Last-Modifie
 (green <=30 min, amber <=90, red beyond): the visible signal that was missing when stale data looked
 "LIVE". The stream-batch tile is scored over the **last 48h only** (`REC_WINDOW_HOURS`), because a
 lifetime count is polluted by orphaned old flags after pruning (see §9 reconciliation note).
+
+If the source cannot be read at all, the dashboard says so instead of drawing data. `source_status()`
+probes the canary mart before DuckDB is touched; when the storage refuses the probe, or answers it but
+the single-row summary mart will not load, the pill turns red (`DATA UNAVAILABLE`) and the page shows
+an outage panel with the storage's error code and no tiles. It must never fall back to zeros (§9).
