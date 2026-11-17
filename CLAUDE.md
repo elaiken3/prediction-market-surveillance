@@ -357,16 +357,25 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
   including the bucket root and keys that do not exist. That is the tell: a policy problem answers
   `AccessDenied` and a missing object `NoSuchKey`, but this code comes back for everything because the
   account that owns the bucket is suspended or closed (rarely, AWS has disabled the resource itself).
-  Nothing in this repo can fix it, and the collector lives in the same account, so it is down too. The
-  fix is in the AWS console as the root user of the account in §6 (check Billing first). One-line
-  probe: `curl -s <mart url> | grep -o '<Code>[^<]*'`. Two things let it go unnoticed. Both GitHub
-  monitors had been left `disabled_manually` since the July reboot-loop, so nothing alerted; and the
-  dashboard swallowed the 403 into empty frames and drew green zeros ("0.0% reject rate", "Markets are
-  summing cleanly"), so the page looked like a quiet market instead of an outage. The dashboard now
-  shows an outage panel with the storage's error code (§11). Also: AWS sends suspension and billing
-  notices only to the account's root email, so that must be a mailbox someone reads. Lessons: a
-  disabled alarm is no alarm, so re-enable monitors as soon as the incident that silenced them is over;
-  and an unreadable source must be shown as unknown, never as zero.
+  Nothing in this repo can fix it, and the collector lives in the same account, so it is down too.
+  One-line probe: `curl -s <mart url> | grep -o '<Code>[^<]*'`. While the answer is
+  `AllAccessDisabled` the bucket still exists; `NoSuchBucket` would mean it has been deleted.
+  The cause was not billing. AWS had sent a routine account verification request (identity and
+  payment-method documents), nobody saw it, and AWS suspended the account with a closure date of
+  2026-10-23. The notice was only found on 2026-11-17, after that date. The way back is the secure
+  upload link in the notice; once that link has expired, an "Account and billing" case in the Support
+  Center signed in as the root user of the account in §6, or AWS's no-sign-in account support form.
+  Do not open a replacement AWS account while a review is pending (the notice says that delays it),
+  and AWS's standard rule is that a closed account can be reopened only through Support, within 90
+  days of closure. Three things let it go unnoticed. AWS sends these notices to the account's
+  contacts only, and they sat unread for weeks; both GitHub monitors had been
+  left `disabled_manually` since the July reboot-loop, so nothing alerted; and the dashboard swallowed
+  the 403 into empty frames and drew green zeros ("0.0% reject rate", "Markets are summing cleanly"),
+  so the page looked like a quiet market instead of an outage. The dashboard now shows an outage panel
+  with the storage's error code (§11). Lessons: account notices must reach a mailbox someone reads
+  (add a second delivery channel for AWS managed notifications); a disabled alarm is no alarm, so
+  re-enable monitors as soon as the incident that silenced them is over; and an unreadable source must
+  be shown as unknown, never as zero.
 
 ---
 
@@ -388,12 +397,16 @@ cd /opt/prediction-market-surveillance && git fetch origin && git reset --hard o
 - [ ] Cost hygiene: stop the EC2 instance when not actively collecting (only EBS ~$3-4/mo when stopped).
       Remember the off-box freshness monitor will fire while it is stopped; raise `MAX_AGE_MINUTES` or
       disable the workflow for long stop windows.
-- [ ] **Restore the AWS account** (§9 `AllAccessDisabled`). As of 2026-11-16 the whole deployment
-      (bucket and collector) is offline until the account in §6 is reinstated or the stack is rebuilt
-      elsewhere. Once S3 answers again: start the instance, confirm the S3 `Last-Modified` ticks, then
-      re-enable `marts-freshness`. Nothing irreplaceable lives there: marts are rebuilt every 15 min
-      and the lake keeps only 5 days, so a rebuild is a bucket with the public-read policy, a fresh
-      box with the `pms-s3-writer` role, and `bootstrap.sh`.
+- [ ] **Restore the AWS account** (§9 `AllAccessDisabled`). The account in §6 was suspended over an
+      unanswered verification request (not billing), with a closure date of 2026-10-23, so the whole
+      deployment (bucket and collector) is offline. The bucket still answered `AllAccessDisabled` on
+      2026-11-17, so it had not been deleted. Next: submit the verification documents (§9) and ask
+      Support to hold the closure. Do not create a new AWS account while that review is open. Once
+      S3 answers again: start the instance, confirm the S3 `Last-Modified` ticks, re-enable
+      `marts-freshness`, and add a second delivery channel for AWS account notifications. If AWS
+      will not reinstate the account, rebuild outside it. Nothing irreplaceable lives there: marts
+      are rebuilt every 15 min and the lake keeps only 5 days, so a rebuild is a bucket with the
+      public-read policy, a fresh box with the `pms-s3-writer` role, and `bootstrap.sh`.
 - [ ] Both GitHub workflows have been `disabled_manually` since 2026-07-07. Re-enable
       `marts-freshness` once the pipeline publishes again. Before re-enabling `marts-autorecover`,
       widen its IAM user to `ec2:StopInstances`/`ec2:StartInstances` (§6).
